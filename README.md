@@ -99,17 +99,23 @@ Every deployment-varying value is a `cordis.yml` field:
 
 #### What the model sees
 
-The first turn of a conversation sends the system prompt, the capability list,
-and the whole exchange labelled `User:` / `Assistant:`. Later turns send only the
-messages that are new, because OpenCode already holds the rest. The model sees
-its own prior turns through OpenCode's session rather than through text this
-plugin resends.
+The first turn of a conversation sends a short preamble and the whole exchange
+labelled `User:` / `Assistant:`. Later turns send only the messages that are new,
+because OpenCode already holds the rest. The model sees its own prior turns
+through OpenCode's session rather than through text this plugin resends.
+
+The preamble is deliberately thin: the working directory, and a note that the
+agent has its own tools. The harness system prompt and its tool list are **not**
+forwarded, because nothing in that list is callable from the provider's agent
+turn. Forwarding them made the model announce work it had no way to do — it
+planned a build, named a skill to load, and stopped having written nothing. Set
+`forwardHarnessContext: true` only if you have wired the harness tools through
+to the provider yourself.
 
 #### Token effect
 
-This plugin adds no input tokens of its own. The label prefixes and the
-capability line are part of the delegated instruction, and the provider's own
-counting is reported unchanged in `usage`.
+This plugin adds a few dozen tokens per conversation for the preamble. The
+provider's own counting is reported unchanged in `usage`.
 
 #### KV Cache effect
 
