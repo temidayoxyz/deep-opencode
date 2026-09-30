@@ -80,6 +80,10 @@ Every deployment-varying value is a `cordis.yml` field:
 | `port` | `0` | Port for the managed server; `0` lets the OS choose a free one. |
 | `startupTimeoutMs` | `120000` | Deadline for the server to report its listening URL. |
 | `turnTimeoutMs` | `900000` | Bound on one delegated turn; `0` disables it. |
+| `reuseSessions` | `true` | Keep one OpenCode session per Harness session so turns recall each other. `false` restores one provider session per request. |
+| `maxSessionMappings` | `32` | Maximum Harness sessions mapped to a provider session at once; the least recently used is evicted. |
+| `sessionIdleTtlMs` | `1800000` | Idle lifetime of a mapping; `0` disables idle reclamation. |
+| `sessionTurnGraceMs` | `600000` | Reclaim grace window protecting a turn in flight. |
 | `logDiagnostics` | `true` | Report the managed server's version and discovered models on load. |
 
 ```yaml
@@ -95,10 +99,11 @@ Every deployment-varying value is a `cordis.yml` field:
 
 #### What the model sees
 
-Each dsh turn is flattened into one instruction: the system prompt, then each
-prior user and assistant message labelled `User:` / `Assistant:`, then a closing
-line naming the available capabilities. The text is what this plugin sends to
-OpenCode; OpenCode then applies its own agent behaviour on top of it.
+The first turn of a conversation sends the system prompt, the capability list,
+and the whole exchange labelled `User:` / `Assistant:`. Later turns send only the
+messages that are new, because OpenCode already holds the rest. The model sees
+its own prior turns through OpenCode's session rather than through text this
+plugin resends.
 
 #### Token effect
 
@@ -108,12 +113,24 @@ counting is reported unchanged in `usage`.
 
 #### KV Cache effect
 
-Independent per turn. The delegated instruction is rebuilt for every request from
-the current message history, so this plugin preserves no reusable request prefix
-and does not invalidate one it did not create.
+Independent per turn, and better than a fresh request: the delegated turn runs
+inside one OpenCode session, so the provider's own prefix cache survives across
+turns. A follow-up sends only the new message, so it re-reads a stable prefix
+rather than a rebuilt transcript. A rewritten past message replays the whole
+conversation, which invalidates that reuse.
 
 ## Known Limitations and Deferred Work
 
+- **Continuity is held by the provider, not the log.** A turn sends only what is
+  new, because OpenCode keeps the conversation itself. If Harness rewrites a
+  past message — a compaction, a fork — the cursor loses its anchor and the whole
+  conversation is replayed into a fresh provider session. Continuity then resets
+  to what was replayed.
+- **A fork starts a new provider session.** An inherited prefix is not replayed
+  into the child, so a forked session's provider memory begins at the fork point.
+- **Token accounting counts the whole conversation each turn.** The provider
+  holds the history, so per-turn input tokens reflect everything it re-reads,
+  while the Harness log only records what was sent.
 - **OpenCode owns the turn, not the harness.** The delegated run uses OpenCode's
   own agent and its own tools, so a dsh tool is not what runs on a turn driven
   by this route. The harness still owns the session log, the transcript, and the

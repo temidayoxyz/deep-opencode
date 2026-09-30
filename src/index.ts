@@ -44,7 +44,7 @@ import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, OpenCodeServerPool, type ServerConfig } from './server.ts'
 import { translateEvents, type DirectoryResolver } from './adapter.ts'
-import { SessionRegistry } from './session-registry.ts'
+import { SessionRegistry, deleteReclaimed } from './session-registry.ts'
 
 export const name = 'dsh-deep-opencode'
 export const inject = ['llm', 'sessions']
@@ -218,8 +218,23 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     })()
   }
 
-  // The managed servers outlive individual turns but not the plugin: when this
-  // effect unwinds every child is stopped so a reload cannot orphan a listener.
+  // The managed servers and the mapped provider sessions outlive individual
+  // turns but not the plugin: when this effect unwinds both are released so a
+  // reload orphans neither a listener nor a session on disk.
+  let sweep: ReturnType<typeof setInterval> | undefined
+  ctx.effect(() => {
+    // Reclaiming on a timer is what bounds the provider sessions written to
+    // disk; the count bound is enforced on adopt, so this only reclaims by age.
+    sweep = setInterval(() => {
+      void registry.reclaim().then((ids) => deleteReclaimed(client, ids))
+    }, resolved.sessionIdleTtlMs)
+    sweep.unref?.()
+    return () => {
+      if (sweep !== undefined) clearInterval(sweep)
+      sweep = undefined
+    }
+  })
+
   ctx.effect(() => () => {
     void pool.stopAll()
   })
@@ -228,7 +243,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
 export { OPENCODE_FREE_ROUTE, OPENCODE_PROVIDER, isFreeModel, toFreeModel } from './catalog.ts'
 export { listModels, refreshCatalog }
 export { OpenCodeClient, OpenCodeServer, OpenCodeServerPool, OpenCodeRequestError }
-export { SessionRegistry, digest, planTurn } from './session-registry.ts'
+export { SessionRegistry, deleteReclaimed, digest, planTurn } from './session-registry.ts'
 export type { TurnPlan, RegistryPolicy } from './session-registry.ts'
 export { OpenCodeFreeAdapter, translateEvents }
 export { authorizationHeader } from './server.ts'

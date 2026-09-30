@@ -309,6 +309,18 @@ export class SessionRegistry {
   all(): string[] {
     return [...this.#entries.values()].map((entry) => entry.opencodeSessionId).filter((id) => id !== '')
   }
+
+  /**
+   * Forgets every mapping and returns the provider sessions to delete.
+   *
+   * Used on plugin unload, where the provider servers are about to be stopped
+   * anyway, so the sessions would be left behind on disk.
+   */
+  drain(): string[] {
+    const ids = this.all()
+    this.#entries.clear()
+    return ids
+  }
 }
 
 /** The client operations this registry needs, so it can be exercised without a server. */

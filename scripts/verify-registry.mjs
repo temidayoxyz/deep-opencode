@@ -2,7 +2,7 @@
 //
 // This is pure logic, so it is tested without a server: a wrong delta is a wrong
 // conversation, and it must fail here rather than in a live turn.
-import { SessionRegistry, digest, planTurn } from '../lib/index.js'
+import { SessionRegistry, deleteReclaimed, digest, planTurn } from '../lib/index.js'
 
 let failures = 0
 function check(name, ok, detail) {
@@ -120,6 +120,19 @@ await held.adopt('s2', 'oc_2')
 check('release returns the provider session', (await held.release('s1')) === 'oc_1')
 check('a released session is gone', held.providerSession('s1') === undefined)
 check('all lists the held sessions', held.all().includes('oc_2'), held.all().join(','))
+
+// --- registry: drain for shutdown ---
+const draining = new SessionRegistry()
+await draining.adopt('s1', 'oc_1')
+await draining.adopt('s2', 'oc_2')
+const drained = draining.drain()
+check('drain returns every held session', drained.sort().join(',') === 'oc_1,oc_2', drained.join(','))
+check('drain empties the registry', draining.size === 0, `${draining.size}`)
+
+// --- registry: reclaimed sessions are deleted through the client ---
+const deleted = []
+await deleteReclaimed({ deleteSession: async (id) => { deleted.push(id) } }, ['oc_a', 'oc_b'])
+check('reclaimed provider sessions are deleted', deleted.join(',') === 'oc_a,oc_b', deleted.join(','))
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
