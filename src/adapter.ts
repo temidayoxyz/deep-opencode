@@ -25,7 +25,8 @@ import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, OpenCodeServerPool } from './server.ts'
 import { OPENCODE_PROVIDER, type FreeModel } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
-import { buildPrompt } from './prompt.ts'
+import { buildDeltaPrompt, buildTranscriptPrompt } from './prompt.ts'
+import { digest, planTurn, type SessionRegistry } from './session-registry.ts'
 import {
   EXECUTION_FAILED,
   EXECUTION_SUCCEEDED,
@@ -167,6 +168,8 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
   readonly #pool: OpenCodeServerPool
   readonly #fallbackDirectory: string
   readonly #resolveDirectory: DirectoryResolver
+  readonly #registry: SessionRegistry | undefined
+  readonly #reuseSessions: boolean
   readonly #turnTimeoutMs: number
   readonly #catalogTimeoutMs: number
 
@@ -176,11 +179,15 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
     resolveDirectory: DirectoryResolver,
     turnTimeoutMs: number,
     catalogTimeoutMs: number,
+    registry?: SessionRegistry,
+    reuseSessions = true,
   ) {
     super()
     this.#pool = pool
     this.#fallbackDirectory = fallbackDirectory
     this.#resolveDirectory = resolveDirectory
+    this.#registry = registry
+    this.#reuseSessions = reuseSessions
     this.#turnTimeoutMs = turnTimeoutMs
     this.#catalogTimeoutMs = catalogTimeoutMs
   }
@@ -238,31 +245,86 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
   /**
    * Runs one delegated turn.
    *
-   * A session is created per request so concurrent dsh turns cannot interleave
-   * on shared OpenCode state, and removed when the turn settles. The request
-   * runs against the server owning the session's project directory, because
-   * OpenCode fixes a session's directory when its process starts.
+   * A harness session is mapped onto one OpenCode session so the provider keeps
+   * the conversation, and only what is new is sent. When no mapping exists, or
+   * the cursor found the history had been rewritten, the whole conversation is
+   * replayed into a fresh provider session instead, so a divergence costs
+   * continuity rather than a failed turn. Turns are serialised per harness
+   * session so two cannot read the same cursor.
+   *
+   * The request runs against the server owning the session's project directory,
+   * because OpenCode fixes a session's directory when its process starts.
    */
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const text = buildPrompt(options)
-    if (text.length === 0) {
-      throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
+    const conversation = digest(options)
+    const client = this.#clientFor(options.sessionId)
+
+    // A session id is what makes the conversation mappable. Without one there is
+    // nothing to key on, so the turn is a one-shot transcript.
+    const mapped = options.sessionId !== undefined && this.#reuseSessions
+    const registry = this.#registry
+    const run = async (): Promise<{ providerSessionId: string; text: string }> => {
+      const digestOf = conversation
+      if (!mapped || registry === undefined) {
+        const text = buildTranscriptPrompt(options, digestOf)
+        if (text.length === 0) throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
+        const created = await client.createSession()
+        await client.setModel(created, options.model, OPENCODE_PROVIDER)
+        return { providerSessionId: created, text }
+      }
+      return await registry.withEntry(options.sessionId as Branded<'SessionId'>, async ({ entry, opencodeSessionId }) => {
+        const plan = planTurn(digestOf, entry.sentThrough, entry.preambleSent)
+        let providerSessionId = opencodeSessionId
+        if (providerSessionId === '' || plan.resendAll) {
+          // Either nothing was mapped, or the cursor lost its anchor because the
+          // harness rewrote the prefix. A fresh provider session is the safe
+          // answer: the whole conversation is replayed into it.
+          const previous = providerSessionId
+          providerSessionId = await client.createSession()
+          await client.setModel(providerSessionId, options.model, OPENCODE_PROVIDER)
+          entry.opencodeSessionId = providerSessionId
+          entry.sentThrough = undefined
+          entry.sentCount = 0
+          entry.preambleSent = false
+          if (previous !== '') await client.deleteSession(previous)
+        }
+        const text = plan.resendAll || plan.messages.length === 0
+          ? buildTranscriptPrompt(options, digestOf)
+          : buildDeltaPrompt(options, plan.messages, plan.sendPreamble)
+        if (text.length === 0) {
+          throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
+        }
+        // The cursor is recorded here rather than after the prompt succeeds:
+        // calling back into the registry from inside its own queue would wait on
+        // this turn. A prompt that fails leaves the cursor advanced, which costs
+        // one replayed message on the next turn rather than a lost turn.
+        const last = plan.messages.at(-1)
+        if (last?.id !== undefined) entry.sentThrough = last.id
+        entry.sentCount += plan.messages.length
+        if (plan.sendPreamble) entry.preambleSent = true
+        return { providerSessionId, text }
+      })
     }
 
-    const client = this.#clientFor(options.sessionId)
-    let sessionId: string | undefined
+    let prepared: { providerSessionId: string; text: string }
+    try {
+      prepared = await run()
+    } catch (error) {
+      throw toLlmError(error)
+    }
+
+    const text = prepared.text
+    const sessionId = prepared.providerSessionId
     const blocks = freshBlocks()
     let usageEmitted = false
     let finished = false
 
     try {
-      sessionId = await client.createSession()
-      await client.setModel(sessionId, options.model, OPENCODE_PROVIDER)
-
-      // The event stream is primed before the prompt is sent, because the
-      // provider's deltas are transient: a delta published before this adapter
-      // subscribes is not replayed. The reader runs as its own task and hands
-      // frames over a queue, so this generator stays the only source of yields.
+      // The provider's deltas are transient: one published before this adapter
+      // subscribes is not replayed, so the subscription must be ESTABLISHED, not
+      // merely created, before the prompt goes out. `events()` is lazy, so the
+      // first frame is awaited here; it is the server's own connected notice and
+      // is not part of any turn.
       //
       // The subscription is shared with the caller's signal and with a local
       // controller, so aborting either ends the reader: the server keeps the
@@ -276,30 +338,50 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
         if (options.signal.aborted) subscription.abort()
         else options.signal.addEventListener('abort', onCallerAbort, { once: true })
       }
-      const reader = client.events(subscription.signal)
-      const pump = (async () => {
-        try {
-          for await (const event of reader) {
-            // Only this session's frames belong to this request; a shared
-            // server also reports other sessions' activity.
-            if (event.data?.sessionID !== undefined && event.data.sessionID !== sessionId) continue
-            for (const chunk of translate(event, blocks)) {
-              if (chunk.type === 'usage') usageEmitted = true
-              if (chunk.type === 'finish') finished = true
-              queue.push(chunk)
-            }
-            if (finished) break
-          }
-        } catch (error) {
-          // An abort is the normal end of a completed turn, not a failure.
-          if (!subscription.signal.aborted) queue.fail(toLlmError(error))
-        } finally {
-          queue.close()
+
+      const reader = client.events(subscription.signal)[Symbol.asyncIterator]()
+      let pending = reader.next()
+
+      /** Drains one frame's chunks into the queue. */
+      const consume = (event: OpenCodeEvent): void => {
+        // Only this session's frames belong to this request; a shared server
+        // also reports other sessions' activity, including a mapped session's
+        // earlier turns.
+        if (event.data?.sessionID !== undefined && event.data.sessionID !== sessionId) return
+        for (const chunk of translate(event, blocks)) {
+          if (chunk.type === 'usage') usageEmitted = true
+          if (chunk.type === 'finish') finished = true
+          queue.push(chunk)
         }
-      })()
+      }
 
       try {
+        // Opening the subscription before prompting is what makes the turn's own
+        // output observable; without it the answer can arrive before the reader
+        // is attached and be lost.
+        const opened = await pending
+        if (opened.done !== true) consume(opened.value)
         await client.prompt(sessionId, text)
+
+        // The reader runs as its own task and hands frames over the queue, so
+        // this generator stays the only source of yields.
+        pending = reader.next()
+        const pump = (async () => {
+          try {
+            while (!finished) {
+              const step = await pending
+              if (step.done === true) break
+              consume(step.value)
+              pending = reader.next()
+            }
+          } catch (error) {
+            // An abort is the normal end of a completed turn, not a failure.
+            if (!subscription.signal.aborted) queue.fail(toLlmError(error))
+          } finally {
+            queue.close()
+          }
+        })()
+
         // The provider owns the turn, so a turn that never settles is bounded
         // here; an unbounded wait would hold the dsh step open indefinitely.
         for await (const chunk of withTimeout(queue, this.#turnTimeoutMs)) {
@@ -311,16 +393,16 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
         // otherwise the reader would outlive this generator and hang the task.
         subscription.abort()
         options.signal?.removeEventListener('abort', onCallerAbort)
-        await pump
+        await reader.return?.(undefined)
       }
     } catch (error) {
       // A transport or protocol failure ends the stream terminally; consumers
       // route on the code, never on the message.
       throw toLlmError(error)
     } finally {
-      if (sessionId !== undefined) {
-        await client.deleteSession(sessionId)
-      }
+      // A mapped provider session is the conversation and must survive the turn.
+      // An unmapped one was created for this request alone and is removed.
+      if (!mapped) await client.deleteSession(sessionId)
     }
 
     if (!finished) {

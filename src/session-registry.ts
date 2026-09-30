@@ -53,9 +53,11 @@ interface Entry {
 
 const DEFAULTS: RegistryPolicy = { maxSessions: 32, idleTtlMs: 30 * 60_000, turnGraceMs: 10 * 60_000 }
 
-/** One message's identity and text, as this registry needs it. */
+/** One message's identity, role and text, as this registry needs it. */
 export interface DigestMessage {
   id: MessageId | undefined
+  /** Who said it. Kept because a conversation may hold consecutive user turns. */
+  role: 'user' | 'assistant'
   text: string
 }
 
@@ -73,19 +75,21 @@ function textOf(content: unknown): string {
   return parts.join('')
 }
 
-/** Whether one harness message may be sent to OpenCode as conversation. */
-function isConversible(message: GenerateOptions['messages'][number]): boolean {
+/** The two roles OpenCode can be told about; everything else is not conversation. */
+function isConversible(message: GenerateOptions['messages'][number]): message is GenerateOptions['messages'][number] & { role: 'user' | 'assistant' } {
   // Tool results are OpenCode's own concern: it ran the tools, so replaying
   // harness tool results would describe work it already did.
   return message.role === 'user' || message.role === 'assistant'
 }
 
-/** Projects a request's messages into identity-and-text pairs. */
+/** Projects a request's messages into identity, role and text. */
 export function digest(options: GenerateOptions): DigestMessage[] {
-  return options.messages.filter(isConversible).map((message) => ({
-    id: message.id,
-    text: textOf(message.content),
-  }))
+  const messages: DigestMessage[] = []
+  for (const message of options.messages) {
+    if (!isConversible(message)) continue
+    messages.push({ id: message.id, role: message.role, text: textOf(message.content) })
+  }
+  return messages
 }
 
 /**

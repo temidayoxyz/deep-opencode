@@ -44,6 +44,7 @@ import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, OpenCodeServerPool, type ServerConfig } from './server.ts'
 import { translateEvents, type DirectoryResolver } from './adapter.ts'
+import { SessionRegistry } from './session-registry.ts'
 
 export const name = 'dsh-deep-opencode'
 export const inject = ['llm', 'sessions']
@@ -59,6 +60,19 @@ export interface Config extends Omit<ServerConfig, 'cwd'> {
    * working directory. A session with a project always uses its own.
    */
   cwd?: string
+  /**
+   * Whether a harness session keeps one OpenCode session for its whole
+   * conversation. Disabling it restores one provider session per request, which
+   * gives up conversational continuity: the model cannot recall an earlier turn
+   * and each turn re-sends the transcript.
+   */
+  reuseSessions: boolean
+  /** Maximum harness sessions mapped to a provider session at once. */
+  maxSessionMappings: number
+  /** Idle lifetime of a mapping in milliseconds; `0` disables idle reclamation. */
+  sessionIdleTtlMs: number
+  /** Lifetime of the reclaim grace window protecting a turn in flight. */
+  sessionTurnGraceMs: number
   /**
    * Milliseconds to wait for the delegated turn before ending it. OpenCode owns
    * the turn, so this bounds a turn that never settles; `0` disables the bound.
@@ -106,6 +120,10 @@ const DEFAULTS: Config = {
   host: '127.0.0.1',
   port: 0,
   startupTimeoutMs: 120_000,
+  reuseSessions: true,
+  maxSessionMappings: 32,
+  sessionIdleTtlMs: 1_800_000,
+  sessionTurnGraceMs: 600_000,
   turnTimeoutMs: 900_000,
   catalogTimeoutMs: 60_000,
   logDiagnostics: true,
@@ -134,12 +152,19 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
       return undefined
     }
   }
+  const registry = new SessionRegistry({
+    maxSessions: resolved.maxSessionMappings,
+    idleTtlMs: resolved.sessionIdleTtlMs,
+    turnGraceMs: resolved.sessionTurnGraceMs,
+  })
   const adapter = new OpenCodeFreeAdapter(
     pool,
     fallbackDirectory,
     resolveDirectory,
     resolved.turnTimeoutMs,
     resolved.catalogTimeoutMs,
+    registry,
+    resolved.reuseSessions,
   )
   const discoveryServer = pool.forDirectory(undefined, fallbackDirectory)
   const client = new OpenCodeClient(discoveryServer)
