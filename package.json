@@ -1,0 +1,53 @@
+{
+  "name": "dsh-deep-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode free-tier model provider for DeepSeek Harness. Runs a local `opencode serve` so the free models resolve from inside OpenCode.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "locale/en.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "opencode",
+    "llm",
+    "free-models"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/temidayoxyz/deep-opencode.git"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "prepare": "tsdown",
+    "watch": "tsdown --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-llm": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-llm": "^0.0.1-rc.1",
+    "@types/node": "^22.20.4",
+    "tsdown": "^0.16.2",
+    "typescript": "^5.9.2"
+  }
+}

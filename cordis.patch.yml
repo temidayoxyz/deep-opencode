@@ -1,0 +1,10 @@
+# Deep OpenCode bundle layer: mounts the package on the Loader, which registers
+# the `opencode-free` provider route on `ctx.llm`. The route owns no client half.
+- insert:
+    - id: deep-opencode
+      name: dsh-deep-opencode
+      config:
+        opencodeCommand: opencode
+        host: 127.0.0.1
+        port: 0
+        startupTimeoutMs: 120000
