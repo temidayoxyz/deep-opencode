@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Build
+        run: pnpm run build
+
+      # The published tarball must not depend on a build script the consumer
+      # cannot run, so the build happens here rather than at install time.
+      - name: Check the committed build matches the sources
+        run: |
+          if [ -n "$(git status --porcelain lib)" ]; then
+            echo "::error::lib/ is out of date. Run 'pnpm run build' and commit the result."
+            git --no-pager diff lib
+            exit 1
+          fi
+
+      - name: Verify the tarball contents
+        run: |
+          npm pack --dry-run 2>&1 | tee pack.txt
+          grep -q "lib/index.js" pack.txt || { echo "::error::lib/index.js missing from the package"; exit 1; }
+          grep -q "cordis.patch.yml" pack.txt || { echo "::error::cordis.patch.yml missing from the package"; exit 1; }
+
+      - run: pnpm publish --access public --no-git-checks

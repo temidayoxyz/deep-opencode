@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Build
+        run: pnpm run build
+
+      # `lib/` is committed so a GitHub-address install works without pnpm
+      # running a build script. This fails if the committed build is stale.
+      - name: Check the committed build matches the sources
+        run: |
+          if [ -n "$(git status --porcelain lib)" ]; then
+            echo "::error::lib/ is out of date. Run 'pnpm run build' and commit the result."
+            git --no-pager diff lib
+            exit 1
+          fi
+
+      - name: Verify the package contents
+        run: |
+          npm pack --dry-run 2>&1 | tee pack.txt
+          grep -q "lib/index.js" pack.txt || { echo "::error::lib/index.js missing from the package"; exit 1; }
+          grep -q "cordis.patch.yml" pack.txt || { echo "::error::cordis.patch.yml missing from the package"; exit 1; }
