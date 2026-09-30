@@ -75,6 +75,7 @@ Every deployment-varying value is a `cordis.yml` field:
 | Field | Default | Meaning |
 |---|---|---|
 | `opencodeCommand` | `opencode` | Executable name or path, resolved through `PATH`. |
+| `cwd` | harness working directory | Project directory for a session that has none, and where the model catalogue is read. A session with a project always uses its own. |
 | `host` | `127.0.0.1` | Loopback host the managed server binds. |
 | `port` | `0` | Port for the managed server; `0` lets the OS choose a free one. |
 | `startupTimeoutMs` | `120000` | Deadline for the server to report its listening URL. |
@@ -117,6 +118,12 @@ and does not invalidate one it did not create.
   own agent and its own tools, so a dsh tool is not what runs on a turn driven
   by this route. The harness still owns the session log, the transcript, and the
   turn lifecycle.
+- **One managed server per project directory.** OpenCode fixes a session's project
+  when its process starts, and ignores a per-request directory, so each session's
+  own directory gets its own `opencode serve`. Work in several projects at once
+  therefore costs one OpenCode process per project.
+- **A session with no project directory falls back** to the `cwd` config field,
+  or the harness's own working directory when that is unset.
 - **Conversation history is flattened per turn.** Prior turns are sent as
   labelled text rather than replayed as structured history, because OpenCode runs
   a fresh session per request and never saw the earlier exchanges.

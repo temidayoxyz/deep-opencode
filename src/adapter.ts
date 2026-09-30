@@ -20,7 +20,9 @@ import {
   type LlmResolvedModelInfo,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import type { Branded } from '@deepseek-ai/dsh-brand'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
+import { OpenCodeServer, OpenCodeServerPool } from './server.ts'
 import { OPENCODE_PROVIDER, type FreeModel } from './catalog.ts'
 import { refreshCatalog } from './discovery.ts'
 import { buildPrompt } from './prompt.ts'
@@ -157,18 +159,40 @@ function indexFor(blocks: BlockState, kind: 'text' | 'reasoning', ordinal: numbe
   return allocated
 }
 
-/** A model request delegated to the running OpenCode server. */
-export class OpenCodeFreeAdapter extends LlmAdapter {
-  readonly #client: OpenCodeClient
-  readonly #turnTimeoutMs: number
+/** Resolves the project directory one request should run its agent in. */
+export type DirectoryResolver = (sessionId: Branded<'SessionId'> | undefined) => string | undefined
 
+/** A model request delegated to a running OpenCode server. */
+export class OpenCodeFreeAdapter extends LlmAdapter {
+  readonly #pool: OpenCodeServerPool
+  readonly #fallbackDirectory: string
+  readonly #resolveDirectory: DirectoryResolver
+  readonly #turnTimeoutMs: number
   readonly #catalogTimeoutMs: number
 
-  constructor(client: OpenCodeClient, turnTimeoutMs: number, catalogTimeoutMs: number) {
+  constructor(
+    pool: OpenCodeServerPool,
+    fallbackDirectory: string,
+    resolveDirectory: DirectoryResolver,
+    turnTimeoutMs: number,
+    catalogTimeoutMs: number,
+  ) {
     super()
-    this.#client = client
+    this.#pool = pool
+    this.#fallbackDirectory = fallbackDirectory
+    this.#resolveDirectory = resolveDirectory
     this.#turnTimeoutMs = turnTimeoutMs
     this.#catalogTimeoutMs = catalogTimeoutMs
+  }
+
+  /** The server owning one request's project directory. */
+  #serverFor(sessionId: Branded<'SessionId'> | undefined): OpenCodeServer {
+    return this.#pool.forDirectory(this.#resolveDirectory(sessionId), this.#fallbackDirectory)
+  }
+
+  /** A client bound to the server owning this request's project directory. */
+  #clientFor(sessionId: Branded<'SessionId'> | undefined): OpenCodeClient {
+    return new OpenCodeClient(this.#serverFor(sessionId))
   }
 
   /** Route display metadata for the selector. */
@@ -182,11 +206,13 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
    * Read from the server rather than a pinned list, so a free model OpenCode
    * adds appears without a plugin update. An unreachable server advertises
    * nothing, which leaves the route unselectable in the GUI instead of
-   * offering a model that would fail.
+   * offering a model that would fail. The catalogue is provider-wide, so it is
+   * read from the fallback directory's server rather than starting one per
+   * project.
    */
   override async listModels(): Promise<readonly LlmModelInfo[]> {
     try {
-      return await refreshCatalog(this.#client, this.#catalogTimeoutMs)
+      return await refreshCatalog(this.#clientFor(undefined), this.#catalogTimeoutMs)
     } catch {
       return []
     }
@@ -213,7 +239,9 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
    * Runs one delegated turn.
    *
    * A session is created per request so concurrent dsh turns cannot interleave
-   * on shared OpenCode state, and removed when the turn settles.
+   * on shared OpenCode state, and removed when the turn settles. The request
+   * runs against the server owning the session's project directory, because
+   * OpenCode fixes a session's directory when its process starts.
    */
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const text = buildPrompt(options)
@@ -221,14 +249,15 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
       throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
     }
 
+    const client = this.#clientFor(options.sessionId)
     let sessionId: string | undefined
     const blocks = freshBlocks()
     let usageEmitted = false
     let finished = false
 
     try {
-      sessionId = await this.#client.createSession()
-      await this.#client.setModel(sessionId, options.model, OPENCODE_PROVIDER)
+      sessionId = await client.createSession()
+      await client.setModel(sessionId, options.model, OPENCODE_PROVIDER)
 
       // The event stream is primed before the prompt is sent, because the
       // provider's deltas are transient: a delta published before this adapter
@@ -247,7 +276,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
         if (options.signal.aborted) subscription.abort()
         else options.signal.addEventListener('abort', onCallerAbort, { once: true })
       }
-      const reader = this.#client.events(subscription.signal)
+      const reader = client.events(subscription.signal)
       const pump = (async () => {
         try {
           for await (const event of reader) {
@@ -270,7 +299,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
       })()
 
       try {
-        await this.#client.prompt(sessionId, text)
+        await client.prompt(sessionId, text)
         // The provider owns the turn, so a turn that never settles is bounded
         // here; an unbounded wait would hold the dsh step open indefinitely.
         for await (const chunk of withTimeout(queue, this.#turnTimeoutMs)) {
@@ -290,7 +319,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
       throw toLlmError(error)
     } finally {
       if (sessionId !== undefined) {
-        await this.#client.deleteSession(sessionId)
+        await client.deleteSession(sessionId)
       }
     }
 

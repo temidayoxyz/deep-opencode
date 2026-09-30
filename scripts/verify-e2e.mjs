@@ -2,7 +2,7 @@
 // plugin's own server manager, discover the free models, and run one delegated
 // turn, asserting the stream protocol holds.
 import { existsSync } from 'node:fs'
-import { OpenCodeClient, OpenCodeServer, OpenCodeFreeAdapter, ROUTE, refreshCatalog } from '../lib/index.js'
+import { OpenCodeClient, OpenCodeServerPool, OpenCodeFreeAdapter, ROUTE, refreshCatalog } from '../lib/index.js'
 
 // On Windows the `opencode` launcher on PATH is a shim script rather than an
 // executable, so the real binary is named explicitly here. The plugin itself
@@ -23,7 +23,8 @@ const config = {
   startupTimeoutMs: 120000,
 }
 
-const server = new OpenCodeServer(config)
+const pool = new OpenCodeServerPool(config)
+const server = pool.forDirectory(undefined, process.cwd())
 const client = new OpenCodeClient(server)
 
 let failures = 0
@@ -49,7 +50,7 @@ try {
   check('picked a model', target !== undefined, target?.id)
   if (target === undefined) throw new Error('no free model to exercise')
 
-  const adapter = new OpenCodeFreeAdapter(client, 180000, 90000)
+  const adapter = new OpenCodeFreeAdapter(pool, process.cwd(), () => undefined, 180000, 90000)
   const listed = await adapter.listModels()
   check('adapter advertises models for the GUI', listed.length === models.length, `${listed.length} listed`)
 
@@ -114,7 +115,7 @@ try {
     check('second model available to exercise', false)
   }
 } finally {
-  await server.stop()
+  await pool.stopAll()
   check('server stopped', true)
 }
 

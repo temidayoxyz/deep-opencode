@@ -14,7 +14,7 @@
  */
 import { type ChildProcess, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { accessSync, constants } from 'node:fs'
+import { accessSync, constants, statSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
 
 /** One adapter's process-management settings; all deployment-varying. */
@@ -27,6 +27,18 @@ export interface ServerConfig {
   port: number
   /** Deadline for the child to report a listening URL, in milliseconds. */
   startupTimeoutMs: number
+  /**
+   * Working directory for the child, which is the project OpenCode's agent
+   * works in.
+   *
+   * OpenCode scopes a session by the server's own process directory: the
+   * `directory` query parameter, the `x-opencode-directory` header and a
+   * `directory` body field were all measured to leave the session on the
+   * server's cwd, so a per-request directory is not available. The directory
+   * therefore has to be chosen when the process starts, which is why servers
+   * are pooled per directory rather than shared.
+   */
+  cwd?: string
 }
 
 /** Whether a path names a file this process can execute. */
@@ -34,6 +46,15 @@ function isExecutable(path: string): boolean {
   try {
     accessSync(path, constants.X_OK)
     return true
+  } catch {
+    return false
+  }
+}
+
+/** Whether a path names a directory a child process can be started in. */
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
   } catch {
     return false
   }
@@ -130,6 +151,11 @@ export class OpenCodeServer {
     return this.#binary
   }
 
+  /** The working directory this server runs OpenCode's agent in. */
+  get cwd(): string | undefined {
+    return this.#config.cwd
+  }
+
   /**
    * Starts the child if it is not already running and resolves its address.
    * Concurrent callers share one startup, and a failed startup is not cached so
@@ -158,6 +184,8 @@ export class OpenCodeServer {
         const attempt = spawn(candidate, ['serve', '--hostname', host, '--port', String(port)], {
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
+          // The child's directory is the project its agent works in.
+          ...(this.#config.cwd === undefined ? {} : { cwd: this.#config.cwd }),
         })
         const spawned = await new Promise<boolean>((resolve) => {
           const onError = (error: Error): void => {
@@ -280,4 +308,59 @@ export class OpenCodeServer {
 /** Basic-auth header value for the server's loopback password. */
 export function authorizationHeader(password: string): string {
   return `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
+}
+
+/** Settings shared by every server in a pool; the directory is per server. */
+export type PooledServerConfig = Omit<ServerConfig, 'cwd'>
+
+/**
+ * Keeps one `opencode serve` per working directory.
+ *
+ * OpenCode decides a session's project when its process starts and ignores a
+ * per-request directory, so a shared server would put every project's agent in
+ * whichever directory happened to launch first. Servers are therefore created
+ * on first use for a directory and reused for it afterwards.
+ */
+export class OpenCodeServerPool {
+  readonly #config: PooledServerConfig
+  readonly #servers = new Map<string, OpenCodeServer>()
+
+  constructor(config: PooledServerConfig) {
+    this.#config = config
+  }
+
+  /**
+   * The server for one directory, created but not started.
+   *
+   * An unusable directory falls back to `fallback` rather than failing the
+   * request: a turn that runs in the process directory is better than a turn
+   * that never runs, and the fallback is reported in the request diagnostics.
+   *
+   * @param directory - absolute project directory, when the session has one
+   * @param fallback - directory to use when none is supplied or it is unusable
+   */
+  forDirectory(directory: string | undefined, fallback: string): OpenCodeServer {
+    const chosen = directory !== undefined && isDirectory(directory) ? directory : fallback
+    // Windows paths are case-insensitive, so the key is compared that way too.
+    const key = process.platform === 'win32' ? chosen.toLowerCase() : chosen
+    const existing = this.#servers.get(key)
+    if (existing !== undefined) return existing
+    const server = new OpenCodeServer({ ...this.#config, cwd: chosen })
+    this.#servers.set(key, server)
+    return server
+  }
+
+  /** The directories that currently own a server. */
+  get directories(): string[] {
+    return [...this.#servers.values()]
+      .map((server) => server.cwd)
+      .filter((value): value is string => value !== undefined)
+  }
+
+  /** Stops every server, for plugin unload. */
+  async stopAll(): Promise<void> {
+    const servers = [...this.#servers.values()]
+    this.#servers.clear()
+    await Promise.all(servers.map((server) => server.stop()))
+  }
 }

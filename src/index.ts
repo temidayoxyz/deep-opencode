@@ -21,21 +21,44 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /**
+     * The slice of the session store this plugin reads.
+     *
+     * `@deepseek-ai/dsh-session` is not published to the registry, so the one
+     * accessor needed here is declared instead of depended on: a session's
+     * durable header carries the absolute project directory that storage keys
+     * off. The read is guarded at runtime, so a shape change costs the project
+     * directory rather than the route.
+     */
+    readonly sessions: {
+      get(id: string): { readonly header: { readonly cwd?: string } } | undefined
+    }
+  }
+}
 import { OpenCodeFreeAdapter } from './adapter.ts'
 import { OPENCODE_FREE_ROUTE } from './catalog.ts'
 import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
-import { OpenCodeServer, type ServerConfig } from './server.ts'
-import { translateEvents } from './adapter.ts'
+import { OpenCodeServer, OpenCodeServerPool, type ServerConfig } from './server.ts'
+import { translateEvents, type DirectoryResolver } from './adapter.ts'
 
 export const name = 'dsh-deep-opencode'
-export const inject = ['llm']
+export const inject = ['llm', 'sessions']
 
 /** The provider route this plugin owns; the catalogue validates against it. */
 export const ROUTE = OPENCODE_FREE_ROUTE
 
 /** Plugin configuration; every deployment-varying value is declared here. */
-export interface Config extends ServerConfig {
+export interface Config extends Omit<ServerConfig, 'cwd'> {
+  /**
+   * Working directory for a request whose session carries no project, and the
+   * directory the model catalogue is read from. Omission uses the harness's own
+   * working directory. A session with a project always uses its own.
+   */
+  cwd?: string
   /**
    * Milliseconds to wait for the delegated turn before ending it. OpenCode owns
    * the turn, so this bounds a turn that never settles; `0` disables the bound.
@@ -94,9 +117,32 @@ function resolveConfig(config: Partial<Config> | undefined): Config {
 
 export function apply(ctx: Context, config?: Partial<Config>): void {
   const resolved = resolveConfig(config)
-  const server = new OpenCodeServer(resolved)
-  const client = new OpenCodeClient(server)
-  const adapter = new OpenCodeFreeAdapter(client, resolved.turnTimeoutMs, resolved.catalogTimeoutMs)
+  const pool = new OpenCodeServerPool(resolved)
+  // A request without a session has no project to run in, so it falls back to
+  // the configured directory rather than wherever the harness was launched.
+  const fallbackDirectory = resolved.cwd ?? process.cwd()
+  // OpenCode fixes a session's project when its process starts, so each request
+  // is served by the server owning the dsh session's own directory. Reading it
+  // from the session header is what keeps a project in that project.
+  const resolveDirectory: DirectoryResolver = (sessionId) => {
+    if (sessionId === undefined) return undefined
+    try {
+      return ctx.sessions.get(sessionId)?.header.cwd
+    } catch {
+      // An unavailable or reshaped session store costs the project directory,
+      // not the request: the pool falls back to the configured directory.
+      return undefined
+    }
+  }
+  const adapter = new OpenCodeFreeAdapter(
+    pool,
+    fallbackDirectory,
+    resolveDirectory,
+    resolved.turnTimeoutMs,
+    resolved.catalogTimeoutMs,
+  )
+  const discoveryServer = pool.forDirectory(undefined, fallbackDirectory)
+  const client = new OpenCodeClient(discoveryServer)
 
   // `registerAdapter` is itself an effect whose disposer releases the route, so
   // the route unloads with the plugin under HMR. The handle is that disposer.
@@ -116,14 +162,14 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
         report = {
           status: models.length > 0 ? 'ok' : 'no-models',
           opencodeCommand: resolved.opencodeCommand,
-          resolvedBinary: server.binary ?? null,
+          resolvedBinary: discoveryServer.binary ?? null,
           opencodeVersion: info.version ?? null,
-          baseUrl: server.baseUrl ?? null,
+          baseUrl: discoveryServer.baseUrl ?? null,
           modelCount: models.length,
           models: models.map((model) => model.id),
         }
         ctx.logger.info(
-          `deep-opencode: ${report.resolvedBinary} v${info.version ?? 'unknown'} on ${server.baseUrl ?? 'pending'}; ` +
+          `deep-opencode: ${report.resolvedBinary} v${info.version ?? 'unknown'} on ${discoveryServer.baseUrl ?? 'pending'}; ` +
             `${models.length} free model(s): ${names.length > 0 ? names : 'none'}`,
         )
       } catch (error) {
@@ -134,7 +180,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
         report = {
           status: 'failed',
           opencodeCommand: resolved.opencodeCommand,
-          resolvedBinary: server.binary ?? null,
+          resolvedBinary: discoveryServer.binary ?? null,
           error: message,
         }
         ctx.logger.warn(`deep-opencode: model discovery failed: ${message}`)
@@ -147,16 +193,16 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     })()
   }
 
-  // The managed server outlives individual turns but not the plugin: when this
-  // effect unwinds the child is stopped so a reload cannot orphan a listener.
+  // The managed servers outlive individual turns but not the plugin: when this
+  // effect unwinds every child is stopped so a reload cannot orphan a listener.
   ctx.effect(() => () => {
-    void server.stop()
+    void pool.stopAll()
   })
 }
 
 export { OPENCODE_FREE_ROUTE, OPENCODE_PROVIDER, isFreeModel, toFreeModel } from './catalog.ts'
 export { listModels, refreshCatalog }
-export { OpenCodeClient, OpenCodeServer, OpenCodeRequestError }
+export { OpenCodeClient, OpenCodeServer, OpenCodeServerPool, OpenCodeRequestError }
 export { OpenCodeFreeAdapter, translateEvents }
 export { authorizationHeader } from './server.ts'
 export type { ServerConfig } from './server.ts'
