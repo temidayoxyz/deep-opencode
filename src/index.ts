@@ -18,6 +18,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-llm'
 import { LlmError } from '@deepseek-ai/dsh-llm'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join } from 'node:path'
 import { OpenCodeFreeAdapter } from './adapter.ts'
 import { OPENCODE_FREE_ROUTE } from './catalog.ts'
 import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
@@ -38,12 +41,40 @@ export interface Config extends ServerConfig {
    */
   turnTimeoutMs: number
   /**
+   * Where to write the discovery report. Relative paths resolve against the
+   * harness home; omission writes `deep-opencode/diagnostics.json` there.
+   */
+  diagnosticsPath?: string
+  /**
    * How long to keep asking a server that reports an empty model catalogue.
    * OpenCode answers with none until it has fetched its provider list.
    */
   catalogTimeoutMs: number
   /** Report the managed server's version and discovered models on load. */
   logDiagnostics: boolean
+}
+
+/**
+ * Writes the discovery report where a user can read it.
+ *
+ * Desktop surfaces keep the plugin log inside the app, so an empty model picker
+ * has no explanation available otherwise. The write never fails the mount: a
+ * read-only harness home simply means no file.
+ *
+ * @returns the written path, or `undefined` when it could not be written.
+ */
+async function writeReport(relative: string | undefined, report: Record<string, unknown>): Promise<string | undefined> {
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const target = relative === undefined
+    ? join(home, 'deep-opencode', 'diagnostics.json')
+    : isAbsolute(relative) ? relative : join(home, relative)
+  try {
+    await mkdir(dirname(target), { recursive: true })
+    await writeFile(target, `${JSON.stringify(report, undefined, 2)}\n`, 'utf8')
+    return target
+  } catch {
+    return undefined
+  }
 }
 
 const DEFAULTS: Config = {
@@ -76,12 +107,22 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
 
   if (resolved.logDiagnostics) {
     void (async () => {
+      let report: Record<string, unknown>
       try {
         const info = await client.info()
         const models = await refreshCatalog(client, resolved.catalogTimeoutMs)
         const names = models.map((model) => model.id).join(', ')
+        report = {
+          status: models.length > 0 ? 'ok' : 'no-models',
+          opencodeCommand: resolved.opencodeCommand,
+          resolvedBinary: server.binary ?? null,
+          opencodeVersion: info.version ?? null,
+          baseUrl: server.baseUrl ?? null,
+          modelCount: models.length,
+          models: models.map((model) => model.id),
+        }
         ctx.logger.info(
-          `deep-opencode: ${resolved.opencodeCommand} v${info.version ?? 'unknown'} on ${server.baseUrl ?? 'pending'}; ` +
+          `deep-opencode: ${report.resolvedBinary} v${info.version ?? 'unknown'} on ${server.baseUrl ?? 'pending'}; ` +
             `${models.length} free model(s): ${names.length > 0 ? names : 'none'}`,
         )
       } catch (error) {
@@ -89,8 +130,19 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
         // registered and the failure surfaces on the first request, where the
         // user is asking for a model anyway.
         const message = error instanceof OpenCodeRequestError ? error.message : String(error)
+        report = {
+          status: 'failed',
+          opencodeCommand: resolved.opencodeCommand,
+          resolvedBinary: server.binary ?? null,
+          error: message,
+        }
         ctx.logger.warn(`deep-opencode: model discovery failed: ${message}`)
       }
+      // The desktop app keeps plugin logs where a user cannot read them, and
+      // "the picker is empty" has no other explanation available, so the same
+      // report is written where anyone can find it.
+      const written = await writeReport(resolved.diagnosticsPath, report)
+      if (written !== undefined) ctx.logger.info(`deep-opencode: diagnostics written to ${written}`)
     })()
   }
 
