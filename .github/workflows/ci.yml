@@ -44,3 +44,18 @@ jobs:
           npm pack --dry-run 2>&1 | tee pack.txt
           grep -q "lib/index.js" pack.txt || { echo "::error::lib/index.js missing from the package"; exit 1; }
           grep -q "cordis.patch.yml" pack.txt || { echo "::error::cordis.patch.yml missing from the package"; exit 1; }
+
+      # These need a real OpenCode binary and reach a live provider, so they run
+      # only when one is installed on the runner. The pure checks always run.
+      - name: Unit checks (no provider needed)
+        run: |
+          pnpm run verify:offline
+
+      - name: Live checks (needs the OpenCode CLI)
+        if: hashFiles(format('{0}/.github/**', github.workspace)) != ''
+        run: |
+          if command -v opencode >/dev/null 2>&1; then
+            pnpm run verify:live
+          else
+            echo "::notice::OpenCode CLI not installed on this runner; live checks skipped"
+          fi
