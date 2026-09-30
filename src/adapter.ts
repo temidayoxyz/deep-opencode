@@ -24,7 +24,7 @@ import type { Branded } from '@deepseek-ai/dsh-brand'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, OpenCodeServerPool } from './server.ts'
 import { OPENCODE_PROVIDER, type FreeModel } from './catalog.ts'
-import { refreshCatalog } from './discovery.ts'
+import { listModelInfo, refreshCatalog } from './discovery.ts'
 import { buildDeltaPrompt, buildTranscriptPrompt } from './prompt.ts'
 import { digest, planTurn, type SessionRegistry } from './session-registry.ts'
 import {
@@ -172,6 +172,8 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
   readonly #reuseSessions: boolean
   readonly #turnTimeoutMs: number
   readonly #catalogTimeoutMs: number
+  /** The in-flight background catalogue read, so concurrent picks share one. */
+  #refreshInFlight: Promise<readonly LlmModelInfo[]> | undefined
 
   constructor(
     pool: OpenCodeServerPool,
@@ -218,11 +220,57 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
    * project.
    */
   override async listModels(): Promise<readonly LlmModelInfo[]> {
-    try {
-      return await refreshCatalog(this.#clientFor(undefined), this.#catalogTimeoutMs)
-    } catch {
-      return []
+    const known = listModelInfo()
+    if (known.length > 0) {
+      // Answer from the catalogue already discovered, and refresh behind it.
+      // The picker is asked for a list on every render, and a fresh read costs
+      // seconds while a server is still fetching its providers, so awaiting one
+      // here is what leaves the route unselectable even though the models exist.
+      this.#refreshInBackground()
+      return known
     }
+    try {
+      const models = await refreshCatalog(this.#clientFor(undefined), this.#catalogTimeoutMs)
+      if (models.length > 0) return models
+      // The fallback server answered empty. A chat may already be running on
+      // another server that did fetch its providers, and its catalogue is the
+      // same list, so any server in the pool is worth asking.
+      return await this.#catalogFromAnyRunningServer()
+    } catch {
+      return listModelInfo()
+    }
+  }
+
+  /**
+   * Refreshes the catalogue without making the caller wait for it.
+   *
+   * A read that fails leaves the previous catalogue in place, so a picker that
+   * refreshes in the background never sees the list empty out from under it.
+   */
+  #refreshInBackground(): void {
+    this.#refreshInFlight ??= refreshCatalog(this.#clientFor(undefined), this.#catalogTimeoutMs)
+      .catch(() => listModelInfo())
+      .finally(() => {
+        this.#refreshInFlight = undefined
+      })
+  }
+
+  /** The catalogue, read from whichever server in the pool can report one. */
+  async #catalogFromAnyRunningServer(): Promise<readonly LlmModelInfo[]> {
+    const fallback = this.#pool.forDirectory(undefined, this.#fallbackDirectory).cwd
+    for (const directory of this.#pool.directories) {
+      if (fallback !== undefined && directory.toLowerCase() === fallback.toLowerCase()) continue
+      try {
+        const models = await refreshCatalog(
+          new OpenCodeClient(this.#pool.forDirectory(directory, this.#fallbackDirectory)),
+          Math.min(this.#catalogTimeoutMs, 15_000),
+        )
+        if (models.length > 0) return models
+      } catch {
+        // The next server may still answer; a failure here is not the answer.
+      }
+    }
+    return listModelInfo()
   }
 
   /**

@@ -218,6 +218,32 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     })()
   }
 
+  // Warm the catalogue as soon as the route is registered, independently of the
+  // diagnostics. A picker asked for its list before the first chat finds a cold
+  // server, and a cold server answers empty for seconds; without this the route
+  // reads as having no models at all until something else happens to warm it.
+  {
+    let cancelled = false
+    void (async () => {
+      // The first attempt shares the app's startup window with every other
+      // plugin and with the desktop app's own OpenCode work, so it is retried
+      // past the window rather than trusted on the first answer.
+      for (const delay of [0, 5_000, 15_000]) {
+        if (cancelled) return
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+        try {
+          if ((await refreshCatalog(client, resolved.catalogTimeoutMs)).length > 0) return
+        } catch {
+          // A server that cannot start yet is retried; the route still works,
+          // and the failure surfaces on the first turn if it never recovers.
+        }
+      }
+    })()
+    ctx.effect(() => () => {
+      cancelled = true
+    })
+  }
+
   // The managed servers and the mapped provider sessions outlive individual
   // turns but not the plugin: when this effect unwinds both are released so a
   // reload orphans neither a listener nor a session on disk.

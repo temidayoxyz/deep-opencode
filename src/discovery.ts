@@ -55,7 +55,11 @@ export async function refreshCatalog(client: OpenCodeClient, timeoutMs = CATALOG
       return cached
     }
     if (Date.now() >= deadline) {
-      // The server answered and had no models; report that rather than hanging.
+      // A read that timed out must not discard a catalogue that already worked.
+      // OpenCode fetches its provider list lazily, so a server that is busy or
+      // still starting answers empty; overwriting a good list with that empty
+      // answer is what leaves the model picker showing nothing at all.
+      if (cached.length > 0) return cached
       cached = []
       return cached
     }
