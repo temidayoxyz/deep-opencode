@@ -26,6 +26,7 @@ import { OPENCODE_FREE_ROUTE } from './catalog.ts'
 import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, type ServerConfig } from './server.ts'
+import { translateEvents } from './adapter.ts'
 
 export const name = 'dsh-deep-opencode'
 export const inject = ['llm']
@@ -156,7 +157,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
 export { OPENCODE_FREE_ROUTE, OPENCODE_PROVIDER, isFreeModel, toFreeModel } from './catalog.ts'
 export { listModels, refreshCatalog }
 export { OpenCodeClient, OpenCodeServer, OpenCodeRequestError }
-export { OpenCodeFreeAdapter }
+export { OpenCodeFreeAdapter, translateEvents }
 export { authorizationHeader } from './server.ts'
 export type { ServerConfig } from './server.ts'
 export type { FreeModel } from './catalog.ts'

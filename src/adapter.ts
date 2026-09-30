@@ -127,15 +127,34 @@ async function* withTimeout<T>(queue: AsyncQueue<T>, timeoutMs: number): AsyncGe
   }
 }
 
-/** Block ordinals the provider assigned, keyed by assistant message. */
+/**
+ * Block indexes for one assistant message.
+ *
+ * The harness requires indexes to be allocated in first-seen stream order and
+ * reused for every delta of the same block. OpenCode's `reasoning` and `text`
+ * events each number their own blocks from zero, so its ordinal cannot be used
+ * as the harness index: reasoning 0 and text 0 would collide and one block
+ * would replace the other. Each provider block therefore gets the next harness
+ * index on first sight, keyed by its kind and ordinal.
+ */
 interface BlockState {
   next: number
-  open: Set<number>
+  indexes: Map<string, number>
   assistantMessageID: string | undefined
 }
 
 function freshBlocks(): BlockState {
-  return { next: 0, open: new Set(), assistantMessageID: undefined }
+  return { next: 0, indexes: new Map(), assistantMessageID: undefined }
+}
+
+/** Allocates the harness index for one provider block, reusing it after the first sight. */
+function indexFor(blocks: BlockState, kind: 'text' | 'reasoning', ordinal: number): number {
+  const key = `${kind}:${ordinal}`
+  const existing = blocks.indexes.get(key)
+  if (existing !== undefined) return existing
+  const allocated = blocks.next++
+  blocks.indexes.set(key, allocated)
+  return allocated
 }
 
 /** A model request delegated to the running OpenCode server. */
@@ -300,57 +319,53 @@ function* translate(event: OpenCodeEvent, blocks: BlockState): Generator<StreamC
   const data = event.data ?? {}
 
   if (data.assistantMessageID !== undefined) {
-    // A new assistant message means a new set of block ordinals.
+    // A new assistant message means a fresh set of provider block ordinals.
     if (blocks.assistantMessageID !== data.assistantMessageID) {
       blocks.next = 0
-      blocks.open.clear()
+      blocks.indexes.clear()
       blocks.assistantMessageID = data.assistantMessageID
     }
   }
 
   if (type === TEXT_STARTED) {
-    const index = data.ordinal ?? blocks.next++
-    blocks.open.add(index)
-    yield { type: 'block-start', index, blockType: 'text' }
+    yield { type: 'block-start', index: indexFor(blocks, 'text', data.ordinal ?? 0), blockType: 'text' }
     return
   }
 
   if (type === TEXT_DELTA) {
-    const index = data.ordinal
-    if (index === undefined || data.delta === undefined) return
-    if (!blocks.open.has(index)) {
-      blocks.open.add(index)
-      yield { type: 'block-start', index, blockType: 'text' }
-    }
-    yield { type: 'text-delta', index, text: data.delta }
+    if (data.delta === undefined) return
+    yield { type: 'text-delta', index: indexFor(blocks, 'text', data.ordinal ?? 0), text: data.delta }
     return
   }
 
   if (type === TEXT_ENDED) {
-    const index = data.ordinal
-    if (index === undefined) return
-    yield { type: 'block-end', index, block: { type: 'text', text: data.text ?? '' } }
-    blocks.open.delete(index)
+    yield {
+      type: 'block-end',
+      index: indexFor(blocks, 'text', data.ordinal ?? 0),
+      block: { type: 'text', text: data.text ?? '' },
+    }
+    blocks.indexes.delete(`text:${data.ordinal ?? 0}`)
     return
   }
 
   if (REASONING_STARTED.includes(type)) {
-    const index = data.ordinal ?? blocks.next++
-    yield { type: 'block-start', index, blockType: 'reasoning' }
+    yield { type: 'block-start', index: indexFor(blocks, 'reasoning', data.ordinal ?? 0), blockType: 'reasoning' }
     return
   }
 
   if (REASONING_DELTA.includes(type)) {
-    const index = data.ordinal
-    if (index === undefined || data.delta === undefined) return
-    yield { type: 'reasoning-delta', index, text: data.delta }
+    if (data.delta === undefined) return
+    yield { type: 'reasoning-delta', index: indexFor(blocks, 'reasoning', data.ordinal ?? 0), text: data.delta }
     return
   }
 
   if (REASONING_ENDED.includes(type)) {
-    const index = data.ordinal
-    if (index === undefined) return
-    yield { type: 'block-end', index, block: { type: 'reasoning', text: data.text ?? '' } }
+    yield {
+      type: 'block-end',
+      index: indexFor(blocks, 'reasoning', data.ordinal ?? 0),
+      block: { type: 'reasoning', text: data.text ?? '' },
+    }
+    blocks.indexes.delete(`reasoning:${data.ordinal ?? 0}`)
     return
   }
 
@@ -423,6 +438,27 @@ function toFinishReason(finish: string | undefined, rawFinish: string | undefine
   if (value === 'length' || value === 'max_tokens' || value === 'max-tokens') return { kind: 'max-tokens' }
   if (value === 'tool_calls' || value === 'tool-calls') return { kind: 'tool-calls' }
   return { kind: 'stop' }
+}
+
+/**
+ * Translates a fixed event sequence into stream chunks.
+ *
+ * Exposed so the block-indexing rules can be exercised against a known event
+ * order, including a reasoning block followed by a text block that both number
+ * themselves from zero. That collision is the one a live model reproduces only
+ * intermittently, and when it happened it silently dropped a turn's whole
+ * answer while leaving the thinking visible.
+ *
+ * @param events - provider events in the order the server published them
+ * @returns the equivalent harness stream chunks
+ */
+export function translateEvents(events: readonly OpenCodeEvent[]): StreamChunk[] {
+  const blocks = freshBlocks()
+  const chunks: StreamChunk[] = []
+  for (const event of events) {
+    for (const chunk of translate(event, blocks)) chunks.push(chunk)
+  }
+  return chunks
 }
 
 /** Normalises a client failure onto the harness error taxonomy. */

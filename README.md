@@ -127,6 +127,11 @@ and does not invalidate one it did not create.
 - **A model the installed OpenCode does not serve cannot be used here**, even if
   a catalogue lists it as free. Availability is whatever the running server
   reports, which is why the list is discovered rather than hard-coded.
+- **The transcript reports tools as removed.** A turn driven by this route
+  returns text and never a tool call, while the request declared the harness's
+  tools, so the transcript shows the tool set being emptied once per turn. That
+  is the delegation boundary showing through: OpenCode's own tools ran instead,
+  and the harness did not observe them.
 - **No reasoning-effort selection.** OpenCode chooses its own reasoning settings;
   this route does not expose the provider's effort levels.
 - **Image inputs are not forwarded.** Only text reaches the delegated turn, so a
