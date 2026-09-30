@@ -33,11 +33,14 @@
     "type": "git",
     "url": "git+https://github.com/temidayoxyz/deep-opencode.git"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsdown",
-    "prepare": "tsdown",
     "watch": "tsdown --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "node scripts/verify-e2e.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",

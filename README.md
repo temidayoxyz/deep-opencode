@@ -25,14 +25,33 @@ the free models resolve. No API key is involved. This is the same arrangement
 
 ## Install
 
-Requires the OpenCode CLI on your `PATH` (`opencode --version`). Then, from a
-Harness profile:
+Requires the OpenCode CLI on your `PATH` (`opencode --version`).
+
+From the npm registry, once published:
 
 ```sh
 dsh plugin add dsh-deep-opencode
 ```
 
-or add the bundle to your profile's `cordis.patch.yml`:
+From GitHub:
+
+```sh
+dsh plugin add https://github.com/temidayoxyz/deep-opencode
+```
+
+The built entry point is committed, so a GitHub install needs no build step —
+pnpm refuses to run a git dependency's install scripts, and the package has no
+`prepare` script to run.
+
+To work on it locally instead, clone and install from the path:
+
+```sh
+git clone https://github.com/temidayoxyz/deep-opencode.git
+cd deep-opencode && npm install && npm run build
+dsh plugin add D:/path/to/deep-opencode
+```
+
+Or add it to a profile's `cordis.patch.yml`:
 
 ```yaml
 - name: dsh-deep-opencode

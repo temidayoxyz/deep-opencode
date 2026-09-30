@@ -1,6 +1,10 @@
 node_modules/
-lib/
 *.log
 .DS_Store
 
 package-lock.json
+
+# `lib/` is committed on purpose. Installing from a GitHub address runs pnpm,
+# which refuses to execute a git dependency's build scripts, so the built entry
+# point has to travel with the source. Regenerate it with `npm run build` and
+# commit the result; CI checks that it matches the sources.
