@@ -10,8 +10,23 @@
 import type { LlmModelInfo, LlmModelContext, ModelModality } from '@deepseek-ai/dsh-llm'
 import type { OpenCodeModelEntry } from './wire.ts'
 
-/** Provider id the free models are listed under. */
+/**
+ * The provider id OpenCode's own API lists the free models under.
+ *
+ * This is sent to `opencode serve` when a session's model is selected, and it
+ * is deliberately not the route name: `opencode` is also a provider in the
+ * shared models.dev catalogue that the harness already registers, so reusing it
+ * as a route would collide.
+ */
 export const OPENCODE_PROVIDER = 'opencode'
+
+/**
+ * The provider route this plugin registers on `ctx.llm`.
+ *
+ * Model metadata the harness validates must carry this exact value as its
+ * `provider`; `OPENCODE_PROVIDER` is only ever sent over the wire.
+ */
+export const OPENCODE_FREE_ROUTE = 'opencode-free'
 
 /** One discovered free model, with the metadata the harness needs. */
 export interface FreeModel extends LlmModelInfo {
@@ -32,7 +47,9 @@ export function isFreeModel(entry: OpenCodeModelEntry): boolean {
 export function toFreeModel(entry: OpenCodeModelEntry): FreeModel {
   const context = entry.limit?.context
   return {
-    provider: OPENCODE_PROVIDER,
+    // The harness validates that advertised metadata names the route it is
+    // registered under, so this is the route rather than OpenCode's provider id.
+    provider: OPENCODE_FREE_ROUTE,
     id: entry.id,
     name: entry.name ?? entry.id,
     inputModalities: readModalities(entry),

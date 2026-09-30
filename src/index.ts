@@ -19,6 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-llm'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { OpenCodeFreeAdapter } from './adapter.ts'
+import { OPENCODE_FREE_ROUTE } from './catalog.ts'
 import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
 import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, type ServerConfig } from './server.ts'
@@ -26,8 +27,8 @@ import { OpenCodeServer, type ServerConfig } from './server.ts'
 export const name = 'dsh-deep-opencode'
 export const inject = ['llm']
 
-/** The provider route this plugin owns. */
-export const ROUTE = 'opencode-free'
+/** The provider route this plugin owns; the catalogue validates against it. */
+export const ROUTE = OPENCODE_FREE_ROUTE
 
 /** Plugin configuration; every deployment-varying value is declared here. */
 export interface Config extends ServerConfig {
@@ -100,6 +101,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   })
 }
 
+export { OPENCODE_FREE_ROUTE, OPENCODE_PROVIDER, isFreeModel, toFreeModel } from './catalog.ts'
 export { listModels, refreshCatalog }
 export { OpenCodeClient, OpenCodeServer, OpenCodeRequestError }
 export { OpenCodeFreeAdapter }
