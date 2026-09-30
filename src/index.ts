@@ -90,6 +90,16 @@ export interface Config extends Omit<ServerConfig, 'cwd'> {
   catalogTimeoutMs: number
   /** Report the managed server's version and discovered models on load. */
   logDiagnostics: boolean
+  /**
+   * Forward the harness system prompt and tool list to the provider.
+   *
+   * Off by default. The provider runs its own agent turn with its own tools, so
+   * the harness prompt describes tools that were never given to it: with it
+   * forwarded, the model reliably announces it will read files, load a skill
+   * and run a command, and then stops, having no way to do any of it. Leave it
+   * on only if the harness tools are actually wired through to the provider.
+   */
+  forwardHarnessContext: boolean
 }
 
 /**
@@ -127,6 +137,7 @@ const DEFAULTS: Config = {
   turnTimeoutMs: 900_000,
   catalogTimeoutMs: 60_000,
   logDiagnostics: true,
+  forwardHarnessContext: false,
 }
 
 function resolveConfig(config: Partial<Config> | undefined): Config {
@@ -165,6 +176,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     resolved.catalogTimeoutMs,
     registry,
     resolved.reuseSessions,
+    resolved.forwardHarnessContext,
   )
   const discoveryServer = pool.forDirectory(undefined, fallbackDirectory)
   const client = new OpenCodeClient(discoveryServer)

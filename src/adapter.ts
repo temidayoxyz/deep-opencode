@@ -25,7 +25,7 @@ import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
 import { OpenCodeServer, OpenCodeServerPool } from './server.ts'
 import { OPENCODE_PROVIDER, type FreeModel } from './catalog.ts'
 import { listModelInfo, refreshCatalog } from './discovery.ts'
-import { buildDeltaPrompt, buildTranscriptPrompt } from './prompt.ts'
+import { buildDeltaPrompt, buildTranscriptPrompt, type PreambleContext } from './prompt.ts'
 import { digest, planTurn, type SessionRegistry } from './session-registry.ts'
 import {
   EXECUTION_FAILED,
@@ -174,6 +174,8 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
   readonly #catalogTimeoutMs: number
   /** The in-flight background catalogue read, so concurrent picks share one. */
   #refreshInFlight: Promise<readonly LlmModelInfo[]> | undefined
+  /** Whether the harness system prompt and tool list are forwarded verbatim. */
+  readonly #forwardHarnessContext: boolean
 
   constructor(
     pool: OpenCodeServerPool,
@@ -183,6 +185,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
     catalogTimeoutMs: number,
     registry?: SessionRegistry,
     reuseSessions = true,
+    forwardHarnessContext = false,
   ) {
     super()
     this.#pool = pool
@@ -192,6 +195,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
     this.#reuseSessions = reuseSessions
     this.#turnTimeoutMs = turnTimeoutMs
     this.#catalogTimeoutMs = catalogTimeoutMs
+    this.#forwardHarnessContext = forwardHarnessContext
   }
 
   /** The server owning one request's project directory. */
@@ -314,7 +318,10 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
     const run = async (): Promise<{ providerSessionId: string; text: string }> => {
       const digestOf = conversation
       if (!mapped || registry === undefined) {
-        const text = buildTranscriptPrompt(options, digestOf)
+        const text = buildTranscriptPrompt(options, {
+          workingDirectory: this.#serverFor(options.sessionId).cwd,
+          forwardHarnessContext: this.#forwardHarnessContext,
+        }, digestOf)
         if (text.length === 0) throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
         const created = await client.createSession()
         await client.setModel(created, options.model, OPENCODE_PROVIDER)
@@ -341,9 +348,13 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
         // sending a prompt to a session pinned to a model the caller did not ask
         // for is what the provider rejects.
         await client.setModel(providerSessionId, options.model, OPENCODE_PROVIDER)
+        const preamble: PreambleContext = {
+          workingDirectory: this.#serverFor(options.sessionId).cwd,
+          forwardHarnessContext: this.#forwardHarnessContext,
+        }
         const text = plan.resendAll || plan.messages.length === 0
-          ? buildTranscriptPrompt(options, digestOf)
-          : buildDeltaPrompt(options, plan.messages, plan.sendPreamble)
+          ? buildTranscriptPrompt(options, preamble, digestOf)
+          : buildDeltaPrompt(options, preamble, plan.messages, plan.sendPreamble)
         if (text.length === 0) {
           throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
         }
