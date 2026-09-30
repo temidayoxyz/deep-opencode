@@ -281,13 +281,18 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
           // answer: the whole conversation is replayed into it.
           const previous = providerSessionId
           providerSessionId = await client.createSession()
-          await client.setModel(providerSessionId, options.model, OPENCODE_PROVIDER)
           entry.opencodeSessionId = providerSessionId
           entry.sentThrough = undefined
           entry.sentCount = 0
           entry.preambleSent = false
           if (previous !== '') await client.deleteSession(previous)
         }
+        // The model is selected per session and persists until switched, so it
+        // is set on every turn, not only on creation. Setting it once would make
+        // a model change in the harness silently keep running the old model, and
+        // sending a prompt to a session pinned to a model the caller did not ask
+        // for is what the provider rejects.
+        await client.setModel(providerSessionId, options.model, OPENCODE_PROVIDER)
         const text = plan.resendAll || plan.messages.length === 0
           ? buildTranscriptPrompt(options, digestOf)
           : buildDeltaPrompt(options, plan.messages, plan.sendPreamble)
