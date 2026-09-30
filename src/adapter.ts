@@ -1,0 +1,435 @@
+/**
+ * The `opencode-free` adapter: one delegated turn per model request.
+ *
+ * OpenCode's Zen endpoint refuses its free models for clients that are not
+ * OpenCode, so this adapter does not call the gateway at all. It runs a real
+ * `opencode serve` and asks that process to run the turn, translating the
+ * server's event stream into the harness stream protocol. This is the same
+ * arrangement OpenChamber uses, and the reason no API key is involved.
+ *
+ * Protocol obligations honoured here: `usage` precedes `finish`, nothing is
+ * emitted after `finish`, block indexes follow the provider's first-seen
+ * `ordinal`, and failures end the stream in a terminal `finish` rather than
+ * throwing mid-stream.
+ */
+import {
+  LlmAdapter,
+  LlmError,
+  type GenerateOptions,
+  type LlmModelInfo,
+  type LlmResolvedModelInfo,
+  type StreamChunk,
+} from '@deepseek-ai/dsh-llm'
+import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
+import { OPENCODE_PROVIDER, type FreeModel } from './catalog.ts'
+import { refreshCatalog } from './discovery.ts'
+import { buildPrompt } from './prompt.ts'
+import {
+  EXECUTION_FAILED,
+  EXECUTION_SUCCEEDED,
+  REASONING_DELTA,
+  REASONING_ENDED,
+  REASONING_STARTED,
+  STEP_ENDED,
+  TEXT_DELTA,
+  TEXT_ENDED,
+  TEXT_STARTED,
+  type OpenCodeEvent,
+} from './wire.ts'
+
+/**
+ * A single-consumer async queue fed by a background reader.
+ *
+ * The provider's event stream is consumed by its own task while the request's
+ * generator drains this queue, which keeps the stream protocol's yields in one
+ * place and lets the subscription be established before the prompt is sent.
+ */
+class AsyncQueue<T> {
+  readonly #items: T[] = []
+  readonly #waiters: ((result: IteratorResult<T>) => void)[] = []
+  #failure: LlmError | undefined
+  #closed = false
+
+  push(item: T): void {
+    if (this.#closed) return
+    const waiter = this.#waiters.shift()
+    if (waiter !== undefined) {
+      waiter({ value: item, done: false })
+      return
+    }
+    this.#items.push(item)
+  }
+
+  /** Records the failure and closes; a failure is reported after queued chunks. */
+  fail(error: LlmError): void {
+    this.#failure = error
+    this.close()
+  }
+
+  close(): void {
+    if (this.#closed) return
+    this.#closed = true
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter({ value: undefined as T, done: true })
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (true) {
+      const item = this.#items.shift()
+      if (item !== undefined) {
+        yield item
+        continue
+      }
+      if (this.#closed) {
+        // Chunks queued before the failure are already delivered, so a turn that
+        // streamed text and then failed still yields that text.
+        if (this.#failure !== undefined) throw this.#failure
+        return
+      }
+      await new Promise<void>((resolve) => {
+        this.#waiters.push((result) => {
+          if (result.done === false) this.#items.unshift(result.value)
+          resolve()
+        })
+      })
+    }
+  }
+}
+
+/**
+ * Bounds one queue drain.
+ *
+ * The provider owns the turn, so a turn that never settles would hold the dsh
+ * step open indefinitely. A non-positive `timeoutMs` disables the bound.
+ */
+async function* withTimeout<T>(queue: AsyncQueue<T>, timeoutMs: number): AsyncGenerator<T> {
+  if (timeoutMs <= 0) {
+    yield* queue
+    return
+  }
+  const iterator = queue[Symbol.asyncIterator]()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new LlmError(`opencode-free turn did not settle within ${timeoutMs}ms`, 'TIMEOUT'))
+    }, timeoutMs)
+    timer.unref?.()
+  })
+  try {
+    while (true) {
+      const result = await Promise.race([iterator.next(), expiry])
+      if (result.done === true) return
+      yield result.value
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/** Block ordinals the provider assigned, keyed by assistant message. */
+interface BlockState {
+  next: number
+  open: Set<number>
+  assistantMessageID: string | undefined
+}
+
+function freshBlocks(): BlockState {
+  return { next: 0, open: new Set(), assistantMessageID: undefined }
+}
+
+/** A model request delegated to the running OpenCode server. */
+export class OpenCodeFreeAdapter extends LlmAdapter {
+  readonly #client: OpenCodeClient
+  readonly #turnTimeoutMs: number
+
+  readonly #catalogTimeoutMs: number
+
+  constructor(client: OpenCodeClient, turnTimeoutMs: number, catalogTimeoutMs: number) {
+    super()
+    this.#client = client
+    this.#turnTimeoutMs = turnTimeoutMs
+    this.#catalogTimeoutMs = catalogTimeoutMs
+  }
+
+  /** Route display metadata for the selector. */
+  override providerInfo(provider: string): { id: string; name: string } {
+    return { id: provider, name: 'OpenCode Free' }
+  }
+
+  /**
+   * The free models the running server offers.
+   *
+   * Read from the server rather than a pinned list, so a free model OpenCode
+   * adds appears without a plugin update. An unreachable server advertises
+   * nothing, which leaves the route unselectable in the GUI instead of
+   * offering a model that would fail.
+   */
+  override async listModels(): Promise<readonly LlmModelInfo[]> {
+    try {
+      return await refreshCatalog(this.#client, this.#catalogTimeoutMs)
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * Metadata for one exact model, from the same discovery read.
+   *
+   * Resolution is advisory and independent of the catalogue, so an id the
+   * catalogue does not list still resolves and a request can still route; the
+   * GUI is the surface that requires membership.
+   */
+  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    const models = await this.listModels()
+    const found = models.find((entry) => entry.id === model)
+    const resolved: LlmResolvedModelInfo = { provider, id: model, name: found?.name ?? model }
+    const context = (found as FreeModel | undefined)?.context
+    if (context !== undefined) resolved.context = context
+    if (found?.inputModalities !== undefined) resolved.inputModalities = found.inputModalities
+    return resolved
+  }
+
+  /**
+   * Runs one delegated turn.
+   *
+   * A session is created per request so concurrent dsh turns cannot interleave
+   * on shared OpenCode state, and removed when the turn settles.
+   */
+  override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const text = buildPrompt(options)
+    if (text.length === 0) {
+      throw new LlmError('opencode-free received a request with no text to send', 'INVALID_REQUEST')
+    }
+
+    let sessionId: string | undefined
+    const blocks = freshBlocks()
+    let usageEmitted = false
+    let finished = false
+
+    try {
+      sessionId = await this.#client.createSession()
+      await this.#client.setModel(sessionId, options.model, OPENCODE_PROVIDER)
+
+      // The event stream is primed before the prompt is sent, because the
+      // provider's deltas are transient: a delta published before this adapter
+      // subscribes is not replayed. The reader runs as its own task and hands
+      // frames over a queue, so this generator stays the only source of yields.
+      //
+      // The subscription is shared with the caller's signal and with a local
+      // controller, so aborting either ends the reader: the server keeps the
+      // stream open indefinitely, and the turn is over at the first `finish`.
+      const queue = new AsyncQueue<StreamChunk>()
+      const subscription = new AbortController()
+      const onCallerAbort = (): void => {
+        subscription.abort()
+      }
+      if (options.signal !== undefined) {
+        if (options.signal.aborted) subscription.abort()
+        else options.signal.addEventListener('abort', onCallerAbort, { once: true })
+      }
+      const reader = this.#client.events(subscription.signal)
+      const pump = (async () => {
+        try {
+          for await (const event of reader) {
+            // Only this session's frames belong to this request; a shared
+            // server also reports other sessions' activity.
+            if (event.data?.sessionID !== undefined && event.data.sessionID !== sessionId) continue
+            for (const chunk of translate(event, blocks)) {
+              if (chunk.type === 'usage') usageEmitted = true
+              if (chunk.type === 'finish') finished = true
+              queue.push(chunk)
+            }
+            if (finished) break
+          }
+        } catch (error) {
+          // An abort is the normal end of a completed turn, not a failure.
+          if (!subscription.signal.aborted) queue.fail(toLlmError(error))
+        } finally {
+          queue.close()
+        }
+      })()
+
+      try {
+        await this.#client.prompt(sessionId, text)
+        // The provider owns the turn, so a turn that never settles is bounded
+        // here; an unbounded wait would hold the dsh step open indefinitely.
+        for await (const chunk of withTimeout(queue, this.#turnTimeoutMs)) {
+          yield chunk
+          if (chunk.type === 'finish') break
+        }
+      } finally {
+        // The turn is settled or abandoned, so the subscription ends here;
+        // otherwise the reader would outlive this generator and hang the task.
+        subscription.abort()
+        options.signal?.removeEventListener('abort', onCallerAbort)
+        await pump
+      }
+    } catch (error) {
+      // A transport or protocol failure ends the stream terminally; consumers
+      // route on the code, never on the message.
+      throw toLlmError(error)
+    } finally {
+      if (sessionId !== undefined) {
+        await this.#client.deleteSession(sessionId)
+      }
+    }
+
+    if (!finished) {
+      throw new LlmError('OpenCode ended the turn without a terminal event', 'PROTOCOL')
+    }
+    if (!usageEmitted) {
+      // Usage is not optional: the token meter and cost accounting read it, and
+      // a turn that reports none would silently read as free.
+      throw new LlmError('OpenCode ended the turn without token usage', 'PROTOCOL')
+    }
+  }
+}
+
+/**
+ * Maps one server event onto zero or more stream chunks.
+ *
+ * Unknown event types yield nothing rather than failing the turn, so a renamed
+ * auxiliary event costs observability but not the request. A turn that produces
+ * no text at all still fails, at the caller, because a silent empty turn is the
+ * one drift that must not pass unnoticed.
+ */
+function* translate(event: OpenCodeEvent, blocks: BlockState): Generator<StreamChunk> {
+  const type = event.type
+  if (type === undefined) return
+  const data = event.data ?? {}
+
+  if (data.assistantMessageID !== undefined) {
+    // A new assistant message means a new set of block ordinals.
+    if (blocks.assistantMessageID !== data.assistantMessageID) {
+      blocks.next = 0
+      blocks.open.clear()
+      blocks.assistantMessageID = data.assistantMessageID
+    }
+  }
+
+  if (type === TEXT_STARTED) {
+    const index = data.ordinal ?? blocks.next++
+    blocks.open.add(index)
+    yield { type: 'block-start', index, blockType: 'text' }
+    return
+  }
+
+  if (type === TEXT_DELTA) {
+    const index = data.ordinal
+    if (index === undefined || data.delta === undefined) return
+    if (!blocks.open.has(index)) {
+      blocks.open.add(index)
+      yield { type: 'block-start', index, blockType: 'text' }
+    }
+    yield { type: 'text-delta', index, text: data.delta }
+    return
+  }
+
+  if (type === TEXT_ENDED) {
+    const index = data.ordinal
+    if (index === undefined) return
+    yield { type: 'block-end', index, block: { type: 'text', text: data.text ?? '' } }
+    blocks.open.delete(index)
+    return
+  }
+
+  if (REASONING_STARTED.includes(type)) {
+    const index = data.ordinal ?? blocks.next++
+    yield { type: 'block-start', index, blockType: 'reasoning' }
+    return
+  }
+
+  if (REASONING_DELTA.includes(type)) {
+    const index = data.ordinal
+    if (index === undefined || data.delta === undefined) return
+    yield { type: 'reasoning-delta', index, text: data.delta }
+    return
+  }
+
+  if (REASONING_ENDED.includes(type)) {
+    const index = data.ordinal
+    if (index === undefined) return
+    yield { type: 'block-end', index, block: { type: 'reasoning', text: data.text ?? '' } }
+    return
+  }
+
+  if (type === STEP_ENDED) {
+    // Usage must precede finish, and nothing may follow the terminal chunk.
+    if (data.tokens !== undefined) {
+      yield { type: 'usage', usage: toUsage(data.tokens) }
+    }
+    yield { type: 'finish', reason: toFinishReason(data.finish, data.rawFinish) }
+    return
+  }
+
+  if (EXECUTION_FAILED.includes(type)) {
+    const message = typeof data.message === 'string' ? data.message : 'OpenCode reported a failed execution'
+    yield {
+      type: 'finish',
+      reason: { kind: 'error', failure: { message, code: 'PROVIDER' } },
+    }
+    return
+  }
+
+  if (type === EXECUTION_SUCCEEDED) {
+    // The step that owns the terminal finish is authoritative; a bare execution
+    // success after it must not append a second finish.
+    return
+  }
+
+  // Any other event is auxiliary: ignoring it costs observability, not the turn.
+}
+
+/**
+ * Converts OpenCode's token counters to the harness vocabulary.
+ *
+ * `input` is already disjoint from cache reads, so it maps straight onto
+ * `inputTokens`; cache reads and writes are reported separately, which is what
+ * makes a cache hit visible as a saving rather than as free input.
+ */
+function toUsage(tokens: NonNullable<NonNullable<OpenCodeEvent['data']>['tokens']>): {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
+  totalTokens?: number
+} {
+  const input = tokens.input ?? 0
+  const output = tokens.output ?? 0
+  const cacheRead = tokens.cache?.read
+  const cacheWrite = tokens.cache?.write
+  const reasoning = tokens.reasoning
+  const usage: {
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens?: number
+    cacheWriteTokens?: number
+    reasoningTokens?: number
+    totalTokens?: number
+  } = { inputTokens: input, outputTokens: output }
+  if (cacheRead !== undefined) usage.cacheReadTokens = cacheRead
+  if (cacheWrite !== undefined) usage.cacheWriteTokens = cacheWrite
+  if (reasoning !== undefined && reasoning > 0) usage.reasoningTokens = reasoning
+  // Billed input plus output, excluding the free tier's zero cost.
+  usage.totalTokens = input + output + (cacheRead ?? 0) + (cacheWrite ?? 0)
+  return usage
+}
+
+/** Maps a provider finish string onto the harness finish reasons. */
+function toFinishReason(finish: string | undefined, rawFinish: string | undefined): { kind: 'stop' } | { kind: 'max-tokens' } | { kind: 'tool-calls' } {
+  const value = (rawFinish ?? finish ?? '').toLowerCase()
+  if (value === 'length' || value === 'max_tokens' || value === 'max-tokens') return { kind: 'max-tokens' }
+  if (value === 'tool_calls' || value === 'tool-calls') return { kind: 'tool-calls' }
+  return { kind: 'stop' }
+}
+
+/** Normalises a client failure onto the harness error taxonomy. */
+function toLlmError(error: unknown): LlmError {
+  if (error instanceof LlmError) return error
+  if (error instanceof OpenCodeRequestError) {
+    return new LlmError(error.message, error.code, { cause: error })
+  }
+  return new LlmError(error instanceof Error ? error.message : String(error), 'TRANSPORT')
+}
