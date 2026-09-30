@@ -2,6 +2,7 @@
   "name": "dsh-deep-opencode",
   "version": "0.1.0",
   "description": "OpenCode free-tier model provider for DeepSeek Harness. Runs a local `opencode serve` so the free models resolve from inside OpenCode.",
+  "packageManager": "pnpm@11.7.0",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
