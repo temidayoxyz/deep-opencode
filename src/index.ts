@@ -203,6 +203,8 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
 export { OPENCODE_FREE_ROUTE, OPENCODE_PROVIDER, isFreeModel, toFreeModel } from './catalog.ts'
 export { listModels, refreshCatalog }
 export { OpenCodeClient, OpenCodeServer, OpenCodeServerPool, OpenCodeRequestError }
+export { SessionRegistry, digest, planTurn } from './session-registry.ts'
+export type { TurnPlan, RegistryPolicy } from './session-registry.ts'
 export { OpenCodeFreeAdapter, translateEvents }
 export { authorizationHeader } from './server.ts'
 export type { ServerConfig } from './server.ts'
