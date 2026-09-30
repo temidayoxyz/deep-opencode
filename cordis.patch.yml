@@ -1,10 +1,9 @@
 # Deep OpenCode bundle layer: mounts the package on the Loader, which registers
 # the `opencode-free` provider route on `ctx.llm`. The route owns no client half.
+#
+# Only the row is inserted. An inserted row carrying its own `config` becomes a
+# layer below the profile's patch, which then overrides it, so configuration
+# belongs in the profile's `cordis.patch.yml` instead of here.
 - insert:
     - id: deep-opencode
       name: dsh-deep-opencode
-      config:
-        opencodeCommand: opencode
-        host: 127.0.0.1
-        port: 0
-        startupTimeoutMs: 120000
