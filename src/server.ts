@@ -347,7 +347,12 @@ export class OpenCodeServer {
   /** Permanently close a pooled server, including references retained by clients. */
   async dispose(): Promise<void> {
     this.#disposed = true
-    await this.stop()
+    const starting = this.#starting
+    try { await this.stop() } finally {
+      // Startup may still be preparing the environment or awaiting spawn before
+      // #child is assigned. Its cancellation must finish before runtime cleanup.
+      await starting?.catch(() => undefined)
+    }
   }
 }
 

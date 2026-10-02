@@ -4,6 +4,8 @@ node_modules/
 
 package-lock.json
 .context-verification-*/
+.companion-verification-*/
+.plugin-update-verification-*/
 
 # `lib/` is committed on purpose. Installing from a GitHub address runs pnpm,
 # which refuses to execute a git dependency's build scripts, so the built entry

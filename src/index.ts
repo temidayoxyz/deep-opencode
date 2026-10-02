@@ -49,6 +49,7 @@ import { SessionRegistry } from './session-registry.ts'
 import { requestHarnessPermission, type HarnessApprovalHost } from './approval.ts'
 import { HarnessToolBridge, type HarnessToolHost } from './tool-bridge.ts'
 import { toolBridgeEnvironment } from './tool-bridge-environment.ts'
+import { OpenCodeCompanion } from './companion-runtime.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -163,7 +164,8 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   let toolHost: HarnessToolHost | undefined
   const toolBridge = new HarnessToolBridge(() => toolHost)
   const pluginDirectory = fileURLToPath(new URL('./opencode/', import.meta.url))
-  const pool = new OpenCodeServerPool(resolved, () => toolBridgeEnvironment(toolBridge, pluginDirectory))
+  const companion = new OpenCodeCompanion(pluginDirectory)
+  const pool = new OpenCodeServerPool(resolved, async () => toolBridgeEnvironment(toolBridge, await companion.directory()))
   // A request without a session has no project to run in, so it falls back to
   // the configured directory rather than wherever the harness was launched.
   const fallbackDirectory = resolved.cwd ?? process.cwd()
@@ -327,8 +329,12 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   })
 
   ctx.effect(() => () => {
-    void adapter.dispose().then(() => registry.deleteSessions(registry.drain()))
-      .finally(async () => { try { await pool.stopAll() } finally { await toolBridge?.dispose() } })
+    return adapter.dispose().then(() => registry.deleteSessions(registry.drain()))
+      .finally(async () => {
+        try { await pool.stopAll() } finally {
+          try { await toolBridge.dispose() } finally { await companion.dispose() }
+        }
+      })
       .catch((error) => ctx.logger.warn(`deep-opencode: shutdown failed: ${String(error)}`))
   })
 }
@@ -348,4 +354,5 @@ export { LlmError }
 export { requestHarnessPermission }
 export type { HarnessApprovalHost } from './approval.ts'
 export { HarnessToolBridge, toolBridgeEnvironment }
+export { OpenCodeCompanion }
 export type { HarnessToolHost, HarnessToolAgent, ToolBridgeBinding, ToolBridgeTurn } from './tool-bridge.ts'

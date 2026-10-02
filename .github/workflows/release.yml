@@ -31,7 +31,7 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
 
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
 
       - name: Typecheck
         run: pnpm run typecheck
@@ -53,6 +53,7 @@ jobs:
         run: |
           npm pack --dry-run 2>&1 | tee pack.txt
           grep -q "lib/index.js" pack.txt || { echo "::error::lib/index.js missing from the package"; exit 1; }
+          grep -q "lib/opencode/index.js" pack.txt || { echo "::error::lib/opencode/index.js missing from the package"; exit 1; }
           grep -q "cordis.patch.yml" pack.txt || { echo "::error::cordis.patch.yml missing from the package"; exit 1; }
 
       - run: pnpm publish --access public --no-git-checks

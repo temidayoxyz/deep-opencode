@@ -46,8 +46,9 @@
     "verify:agent": "node scripts/verify-agent-run.mjs",
     "verify:server": "node scripts/verify-server.mjs",
     "verify:context": "node scripts/verify-context-native.mjs",
+    "verify:update": "node scripts/verify-plugin-update.mjs",
     "verify:bridge": "node scripts/verify-tool-bridge-live.mjs",
-    "verify:offline": "node scripts/verify-blocks.mjs && node scripts/verify-metadata.mjs && node scripts/verify-registry.mjs && node scripts/verify-lifecycle.mjs && node scripts/verify-client.mjs && node scripts/verify-approval.mjs && node scripts/verify-discovery.mjs && node scripts/verify-tool-bridge.mjs && node scripts/verify-opencode-plugin.mjs",
+    "verify:offline": "node scripts/verify-dependencies.mjs && node scripts/verify-blocks.mjs && node scripts/verify-metadata.mjs && node scripts/verify-registry.mjs && node scripts/verify-lifecycle.mjs && node scripts/verify-client.mjs && node scripts/verify-approval.mjs && node scripts/verify-discovery.mjs && node scripts/verify-tool-bridge.mjs && node scripts/verify-opencode-plugin.mjs && node scripts/verify-plugin-unload.mjs && node scripts/verify-companion-runtime.mjs && node scripts/verify-server-startup.mjs",
     "verify:live": "node scripts/verify-e2e.mjs && node scripts/verify-directory.mjs && node scripts/verify-continuity.mjs && node scripts/verify-adapter-continuity.mjs && node scripts/verify-resolve.mjs"
   },
   "peerDependencies": {
@@ -56,6 +57,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-brand": "^0.0.1-rc.1",
     "@deepseek-ai/dsh-llm": "^0.0.1-rc.1",
     "@types/node": "^22.20.4",
     "tsdown": "^0.16.2",

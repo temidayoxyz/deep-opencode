@@ -43,6 +43,11 @@ The built entry point is committed, so a GitHub install needs no build step —
 pnpm refuses to run a git dependency's install scripts, and the package has no
 `prepare` script to run.
 
+If an older Windows installation fails to update with `ERR_PNPM_EPERM`, disable
+this plugin and fully restart Harness, then update while the plugin is disabled.
+Re-enable it and restart after the update. Older versions let OpenCode watch
+the installed package directory; the updated version watches a temporary copy.
+
 To work on it locally instead, clone and install from the path:
 
 ```sh
@@ -171,6 +176,10 @@ work before releasing the step. It uses an authenticated loopback listener and
 adds the companion to the managed child's configuration without changing
 project or global config files. Auxiliary requests receive context without
 DSH tool access. Replayed history also participates in native compaction.
+The companion runs from a private temporary copy so OpenCode's Windows file
+watcher cannot lock the installed package during an update. Plugin unload waits
+for active turns, managed processes, and the bridge to stop before removing that
+copy. Restart Harness after updating to load the replacement code.
 If a main request declares DSH tools but its live Host
 services are missing, it fails with `NO_TOOL_BRIDGE` instead of pretending the
 tools are available. Set `bridgeHarnessTools: false` to use only native tools.
@@ -250,6 +259,7 @@ npm run build
 npm run verify:offline
 npm run verify:server
 npm run verify:context
+npm run verify:update
 npm run verify:agent
 npm run verify:bridge
 ```
@@ -259,12 +269,17 @@ prompt replay, deadlines, idle reclamation, mapping limits, assistant history,
 cancellation, complete tool loops, interactive requests, DSH approval decisions,
 auxiliary calls, stale discovery after unload, authenticated tool transport,
 scope isolation, policy denials, journal events, exactly-once dispatch, step
-closure, cancellation, conclusion, and companion registration. `verify:server` checks local
+closure, cancellation, conclusion, companion registration, declared source
+dependencies, asynchronous plugin unload, and runtime-copy cleanup.
+`verify:server` checks local
 process startup, restart, disposal, and Windows descendant shutdown.
 `verify:context` runs the installed OpenCode against a local deterministic model.
 It checks exact persisted human messages, model-facing context and replay,
 synthetic continuations, auxiliary requests, and native overflow compaction.
 Its temporary workspace and runtime data are isolated inside the repository.
+`verify:update` runs real OpenCode without a model request and verifies that
+the active staged companion permits renaming its installed package on Windows.
+It also reproduces the old lock with an in-package companion as a control.
 `verify:agent` requires a working OpenCode install and free model. It builds an
 eight-section HTML/CSS/JS page in an isolated temporary directory, then reads
 and edits it in the same provider session.
