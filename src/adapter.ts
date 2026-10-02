@@ -20,13 +20,14 @@ import {
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { Branded } from '@deepseek-ai/dsh-brand'
+import { randomBytes } from 'node:crypto'
 import { OpenCodeClient, OpenCodeRequestError, type PermissionRule } from './client.ts'
 import { abortable, turnScope } from './turn.ts'
 import type { HarnessToolBridge, ToolBridgeBinding } from './tool-bridge.ts'
 import { OpenCodeServer, OpenCodeServerPool } from './server.ts'
 import { OPENCODE_PROVIDER, type FreeModel } from './catalog.ts'
 import { listModelInfo, refreshCatalog } from './discovery.ts'
-import { buildDeltaPrompt, buildTranscriptPrompt, type PreambleContext } from './prompt.ts'
+import { buildSystem, contextMessages, type ContextReplay } from './prompt.ts'
 import { digest, planTurn, type SessionRegistry, type SessionState } from './session-registry.ts'
 import {
   EXECUTION_FAILED,
@@ -309,8 +310,12 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
       let toolBinding: ToolBridgeBinding | undefined
       const subscription = new AbortController()
       const signal = AbortSignal.any([scope.signal, subscription.signal])
-      const preamble: PreambleContext = { workingDirectory: options.purpose === undefined ? server.cwd : undefined, forwardHarnessContext: this.#forwardHarnessContext }
-      let plan = planTurn(conversation, entry?.sentThrough, entry?.preambleSent ?? false)
+      // Context is supplied through the companion rather than the human prompt.
+      // A completed synthetic turn can have no conversational anchor yet.
+      // Its native assistant/tool history still exists and must be retained.
+      let plan = entry?.preambleSent && entry.history?.length === 0
+        ? { messages: conversation.filter(message => message.role !== 'assistant' || message.delegated === false), sendPreamble: false, resendAll: false }
+        : planTurn(conversation, entry?.sentThrough, entry?.preambleSent ?? false)
       if (entry !== undefined && (entry.directory !== server.cwd || entry.history?.some((previous, index) => {
         const current = conversation[index]
         return current?.id !== previous.id || current?.role !== previous.role || current?.text !== previous.text
@@ -329,24 +334,34 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
             entry.directory = server.cwd
             entry.sentThrough = undefined
             entry.history = undefined
+            entry.replay = undefined
             entry.sentCount = 0
             entry.preambleSent = false
             registry?.bindClient(sessionId, client)
           }
           if (previous !== '') await registry?.deleteSessions([previous])
         }
-        if (options.sessionId !== undefined && options.purpose === undefined && (options.tools?.length ?? 0) > 0 && this.#integration.toolBridge !== undefined) {
-          toolBinding = this.#integration.toolBridge.bind({
-            harnessSessionId: options.sessionId, providerSessionId: sessionId, tools: options.tools!,
-            model: options.model, system: options.system, signal,
-          })
-        }
-        await abortable(client.setModel(sessionId, options.model, OPENCODE_PROVIDER, signal), signal)
-        const text = plan.resendAll ? buildTranscriptPrompt(options, preamble, conversation)
-          : buildDeltaPrompt(options, preamble, plan.messages, plan.sendPreamble)
-        if (plan.messages.every((message) => message.text.length === 0) || text.length === 0) {
+        const injected = contextMessages(options)
+        const humanIndex = options.purpose === undefined ? plan.messages.findLastIndex(message => message.role === 'user' && message.text.length > 0) : -1
+        const human = plan.messages[humanIndex]
+        if (human === undefined && injected.length === 0 && !(options.purpose !== undefined && (options.system || plan.messages.some(message => message.text.length > 0)))) {
           throw new LlmError('opencode-free received a request with no new text to send', 'INVALID_REQUEST')
         }
+        const promptId = `msg_${randomBytes(32).toString('hex')}`
+        const replayMessages = plan.messages.filter((message, index) => index !== humanIndex && message.text.length > 0).map(({ role, text }) => ({ role, text }))
+        const replay: readonly ContextReplay[] = [...(entry?.replay ?? []).filter(group => !group.compacted), ...(replayMessages.length > 0 ? [{ before: promptId, messages: replayMessages }] : [])]
+        if (this.#integration.toolBridge !== undefined) {
+          toolBinding = this.#integration.toolBridge.bind({
+            harnessSessionId: options.sessionId, providerSessionId: sessionId,
+            tools: options.sessionId !== undefined && options.purpose === undefined && this.#integration.bridgeHarnessTools !== false ? options.tools ?? [] : [],
+            model: options.model, system: buildSystem(options, options.purpose === undefined ? server.cwd : undefined, this.#forwardHarnessContext), signal,
+            context: { before: promptId, replay, messages: injected },
+          })
+        } else if (injected.length > 0 || replay.length > 0 || options.system) {
+          throw new LlmError('DSH context and history replay require the OpenCode companion transport', 'NO_TOOL_BRIDGE')
+        }
+        await abortable(client.setModel(sessionId, options.model, OPENCODE_PROVIDER, signal), signal)
+        const text = human?.text ?? 'Continue using the current DSH context.'
         const blocks = freshBlocks()
         let finished = false
         reader = client.events(signal)[Symbol.asyncIterator]()
@@ -380,7 +395,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
         })()
         // Observe a reader failure even if prompt admission itself is stalled.
         void pump.catch(() => undefined)
-        await abortable(Promise.all([client.prompt(sessionId, text, signal), pump]), signal)
+        await abortable(Promise.all([client.prompt(sessionId, text, signal, { id: promptId, synthetic: human === undefined }), pump]), signal)
         succeeded = terminal?.reason.kind === 'stop' || terminal?.reason.kind === 'max-tokens'
         if (succeeded && entry !== undefined) {
           // Commit only accepted, completed history. Its own assistant output
@@ -389,6 +404,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
           entry.sentCount = conversation.length
           entry.preambleSent = true
           entry.history = conversation
+          entry.replay = replay
         }
       } finally {
         subscription.abort()
@@ -399,6 +415,7 @@ export class OpenCodeFreeAdapter extends LlmAdapter {
             entry.opencodeSessionId = ''
             entry.sentThrough = undefined
             entry.history = undefined
+            entry.replay = undefined
             entry.preambleSent = false
           }
         }
@@ -641,6 +658,7 @@ export interface OpenCodeEventContext {
 /** Optional plugin boundary for native progress and interactive agent requests. */
 export interface OpenCodeIntegration {
   toolBridge?: HarnessToolBridge
+  bridgeHarnessTools?: boolean
   agent?: string
   permissions?: readonly PermissionRule[]
   onEvent?: (context: OpenCodeEventContext) => void | Promise<void>

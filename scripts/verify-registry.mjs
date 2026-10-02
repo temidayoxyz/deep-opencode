@@ -47,13 +47,19 @@ const digested = digest({
   model: 'space-bunny-free',
   messages: [
     { role: 'system', content: [{ type: 'text', text: 'ignored' }] },
-    { role: 'user', id: 'u1', content: [{ type: 'text', text: 'hello' }] },
+    { role: 'user', id: 'skill-context', content: [{ type: 'text', text: 'injected skill' }], source: { kind: 'plugin', plugin: 'skills' } },
+    { role: 'user', id: 'u1', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } },
+    { role: 'user', id: 'runtime-context', content: [{ type: 'text', text: 'injected runtime' }], source: { kind: 'plugin', plugin: 'agent-runtime' } },
     { role: 'assistant', id: 'a1', content: [{ type: 'text', text: 'hi' }] },
     { role: 'tool', id: 't1', content: [{ type: 'text', text: 'tool output' }] },
+    { role: 'user', id: 'tool-result-context', content: [{ type: 'text', text: 'tool result context' }], source: { kind: 'tool', callId: 'call_1' } },
     { role: 'user', id: 'u2', content: [{ type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' }] },
   ],
 })
 check('the system role is not sent as conversation', digested.every((x) => x.text !== 'ignored'))
+check('skill user-role context is not a human conversation turn', !digested.some((x) => x.id === 'skill-context'))
+check('runtime user-role context is not a human conversation turn', !digested.some((x) => x.id === 'runtime-context'))
+check('tool-source user-role context is not a human conversation turn', !digested.some((x) => x.id === 'tool-result-context'))
 check('tool messages are not replayed as conversation', digested.every((x) => x.text !== 'tool output'),
   digested.map((x) => `${x.id}:${x.text}`).join(' '))
 check('conversational roles are digested', digested.length === 3, digested.map((x) => x.id).join(','))

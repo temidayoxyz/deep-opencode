@@ -122,7 +122,7 @@ await test('native DSH calls retain their scope, signal, error outcome, and plug
 await test('disposing the native companion releases its registrations in reverse order', async () => {
   await withCompanion(async ({ teardown, disposed }) => {
     await teardown()
-    assert.deepEqual(disposed, ['session:context', 'tools'])
+    assert.deepEqual(disposed, ['session:compaction', 'session:context', 'tools'])
   })
 })
 
@@ -140,4 +140,51 @@ await test('child environment adds the companion while preserving existing OpenC
     if (previous === undefined) delete process.env.OPENCODE_CONFIG_CONTENT
     else process.env.OPENCODE_CONFIG_CONTENT = previous
   }
+})
+
+await test('DSH context and replay retain their roles outside the recorded human prompt', async () => {
+  const human = { id: 'msg_current', role: 'user', content: [{ type: 'text', text: 'roses are red' }] }
+  const nativeTool = { role: 'tool', content: [{ type: 'tool-result', id: 'call', name: 'read', result: { type: 'text', value: 'done' } }] }
+  await withCompanion(async ({ hooks, requests }) => {
+    const context = { sessionID: 'provider-a', system: [], messages: [human, nativeTool], tools: { dsh_list: {}, dsh_call: {}, native_read: {} } }
+    await hooks.get('context')(context)
+    assert.ok(requests[0].url.endsWith('/context'))
+    assert.deepEqual(context.messages.map(m => m.role), ['user', 'assistant', 'user', 'user', 'tool'])
+    assert.deepEqual(context.messages.map(m => m.content[0].text).slice(0, 4), ['earlier question', 'earlier answer', '<system-reminder>skills</system-reminder>', 'roses are red'])
+    assert.equal(context.messages.at(-2), human)
+    assert.equal(context.messages.at(-1), nativeTool)
+    assert.ok(!context.system.some(p => p.text.includes('<system-reminder>')))
+    assert.deepEqual(context.tools, { native_read: {} }, 'context-only binding must hide DSH tools')
+    assert.ok(hooks.has('compaction'), 'replayed history must participate in native compaction')
+  }, () => ({ status: 200, body: { tools: [], context: {
+    before: 'msg_current',
+    messages: [{ role: 'user', text: '<system-reminder>skills</system-reminder>' }],
+    replay: [{ before: 'msg_current', messages: [{ role: 'user', text: 'earlier question' }, { role: 'assistant', text: 'earlier answer' }] }],
+  } } }))
+})
+
+await test('compaction receives replay and context even after a DSH tool concludes', async () => {
+  await withCompanion(async ({ hooks }) => {
+    assert.ok(hooks.has('compaction'))
+    const context = { sessionID: 'provider-a', system: [], messages: [{ id: 'msg_current', role: 'user', content: [{ type: 'text', text: 'now' }] }], tools: {} }
+    await hooks.get('compaction')(context)
+    assert.equal(context.messages[0].content[0].text, 'past')
+    assert.ok(context.system.some(p => p.text === 'DSH system'))
+  }, () => ({ status: 200, body: { tools: [], concluded: true, system: 'DSH system', context: { before: 'msg_current', messages: [], replay: [{ before: 'msg_current', messages: [{ role: 'assistant', text: 'past' }] }] } } }))
+})
+
+
+await test('compaction includes replay anchored to its omitted recent slice', async () => {
+  await withCompanion(async ({ hooks, requests }) => {
+    const older = { sessionID: 'provider-a', system: [], messages: [{ id: 'msg_older', role: 'user', content: [{ type: 'text', text: 'older native question' }] }], tools: {} }
+    await hooks.get('compaction')(older)
+    assert.ok(older.messages.some(message => message.content[0].text === 'CRITICAL imported history'))
+    assert.equal(older.messages[0].id, 'msg_older', 'recent-slice replay must follow older native history')
+    assert.equal(older.messages[1].content[0].text, 'CRITICAL imported history')
+    assert.equal(requests[0].body.phase, 'compaction')
+    const resumed = { sessionID: 'provider-a', system: [], messages: [{ id: 'checkpoint', role: 'user', content: [{ type: 'text', text: 'summarized native checkpoint' }] }], tools: {} }
+    await hooks.get('context')(resumed)
+    assert.deepEqual(requests[1].body.messageIds, ['checkpoint'])
+    assert.equal(resumed.messages.length, 1, 'already summarized history must not be resurrected')
+  }, () => ({ status: 200, body: { tools: [], context: { before: 'msg_recent', messages: [], replay: [{ before: 'msg_recent', messages: [{ role: 'assistant', text: 'CRITICAL imported history' }] }] } } }))
 })

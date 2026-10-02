@@ -19,6 +19,7 @@ export const ROUTES = {
   sessionPermissionReply: (id: string, request: string): string => `/api/session/${id}/permission/${request}/reply`,
   sessionFormReply: (id: string, form: string): string => `/api/session/${id}/form/${form}/reply`,
   sessionPrompt: (id: string): string => `/api/session/${id}/prompt`,
+  sessionSynthetic: (id: string): string => `/api/session/${id}/synthetic`,
   sessionInterrupt: (id: string): string => `/api/session/${id}/interrupt`,
   eventSubscribe: '/api/event',
 } as const
@@ -157,11 +158,11 @@ export class OpenCodeClient {
   }
 
   /** `POST /api/session/{id}/prompt` — enqueues one turn; output arrives on the event stream. */
-  async prompt(id: string, text: string, signal?: AbortSignal): Promise<void> {
-    await this.#json(ROUTES.sessionPrompt(id), {
+  async prompt(id: string, text: string, signal?: AbortSignal, prompt?: { id: string; synthetic?: boolean }): Promise<void> {
+    await this.#json(prompt?.synthetic ? ROUTES.sessionSynthetic(id) : ROUTES.sessionPrompt(id), {
       method: 'POST',
       signal,
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, ...(prompt === undefined ? {} : { id: prompt.id }) }),
     })
   }
 

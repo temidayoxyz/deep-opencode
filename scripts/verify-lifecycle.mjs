@@ -10,10 +10,11 @@ import {
   SessionRegistry,
 } from '../lib/index.js'
 
-const user = (id, text) => ({ role: 'user', id, content: [{ type: 'text', text }] })
+const user = (id, text, source = { kind: 'user' }) => ({ role: 'user', id, content: [{ type: 'text', text }], source })
+const injected = (id, text, plugin = 'fixture-context') => user(id, text, { kind: 'plugin', plugin })
 const assistant = (id, text) => ({ role: 'assistant', id, content: [{ type: 'text', text }] })
 const options = (sessionId, messages, signal) => ({
-  provider: 'opencode-free', model: 'test-free', sessionId, messages,
+  provider: 'opencode-free', model: 'test-free', sessionId, messages, tools: [],
   ...(signal === undefined ? {} : { signal }),
 })
 const nextTick = () => new Promise((resolve) => setImmediate(resolve))
@@ -86,12 +87,16 @@ async function withFakeClient(run, settings = {}) {
   const pending = new Set()
   const state = {
     prompts: [], deleted: [], interrupted: [], permissionReplies: [], formReplies: [], active: new Map(), maxActive: 0,
-    created: 0, message: 0,
+    bindings: [], created: 0, message: 0,
   }
+  const toolBridge = { bind: (turn) => {
+    state.bindings.push(turn)
+    return { concluded: false, close: async () => undefined }
+  } }
   const registry = new SessionRegistry({ maxSessions: 8, idleTtlMs: 0, turnGraceMs: 0, ...settings.policy })
   const pool = { forDirectory: () => ({ cwd: process.cwd() }), directories: [process.cwd()] }
   const adapter = new OpenCodeFreeAdapter(pool, process.cwd(), () => process.cwd(),
-    settings.timeoutMs ?? 500, 100, registry, true, false, settings.integration)
+    settings.timeoutMs ?? 500, 100, registry, true, false, { toolBridge, ...settings.integration })
 
   function track(promise) {
     pending.add(promise)
@@ -133,8 +138,8 @@ async function withFakeClient(run, settings = {}) {
     } else feed.push({ type: 'server.connected' })
     return feed
   }
-  OpenCodeClient.prototype.prompt = async function (id, text) {
-    state.prompts.push({ id, text })
+  OpenCodeClient.prototype.prompt = async function (id, text, signal, promptOptions) {
+    state.prompts.push({ id, text, options: promptOptions })
     if (settings.rejectFirstPrompt && state.prompts.length === 1) {
       throw new OpenCodeRequestError('the provider rejected the prompt', 'PROVIDER', 500)
     }
@@ -143,7 +148,7 @@ async function withFakeClient(run, settings = {}) {
     state.active.set(id, active)
     state.maxActive = Math.max(state.maxActive, active)
     if (settings.onPrompt !== undefined) {
-      await settings.onPrompt({ id, text, state, emit, finish, track })
+      await settings.onPrompt({ id, text, signal, promptOptions, state, emit, finish, track })
     } else finish(id)
   }
   OpenCodeClient.prototype.interrupt = async function (id) {
@@ -203,8 +208,11 @@ await test('rejected prompts retain their context for the next turn', { timeout:
     const failed = await collect(adapter, options('rejected', firstHistory))
     assert.ok(failureCode(failed), 'the fake rejection must be surfaced to the caller')
     assertSucceeded(await collect(adapter, options('rejected', [...firstHistory, user('u2', 'follow up')])))
-    assert.ok(state.prompts[1].text.includes('CRITICAL CONTEXT'), 'the rejected context was lost on retry')
-    assert.ok(state.prompts[1].text.includes('follow up'))
+    assert.equal(state.prompts[1].text, 'follow up')
+    assert.deepEqual(state.bindings[1]?.context?.replay, [{
+      before: state.prompts[1].options?.id,
+      messages: [{ role: 'user', text: 'CRITICAL CONTEXT that must survive rejection' }],
+    }], 'the rejected context was lost on retry')
   }, { rejectFirstPrompt: true })
 })
 
@@ -358,12 +366,14 @@ await test('rewritten text with the same history IDs creates a fresh provider co
   await withFakeClient(async ({ adapter, registry, state }) => {
     assertSucceeded(await collect(adapter, options('edited', [user('u1', 'original question')])))
     const previous = registry.providerSession('edited')
-    assertSucceeded(await collect(adapter, options('edited', [user('u1', 'edited question'), user('u2', 'follow up')])))
+    assertSucceeded(await collect(adapter, options('edited', [user('u1', 'edited question'), assistant('a1', 'corrected earlier response'), user('u2', 'follow up')])))
     assert.notEqual(registry.providerSession('edited'), previous)
     assert.ok(state.deleted.includes(previous), 'the replaced provider conversation must be reclaimed')
-    assert.ok(state.prompts[1].text.includes('edited question'))
-    assert.ok(state.prompts[1].text.includes('follow up'))
-    assert.ok(!state.prompts[1].text.includes('original question'))
+    assert.equal(state.prompts[1].text, 'follow up')
+    assert.deepEqual(state.bindings[1]?.context?.replay, [{
+      before: state.prompts[1].options?.id,
+      messages: [{ role: 'user', text: 'edited question' }, { role: 'assistant', text: 'corrected earlier response' }],
+    }], 'the edited prefix must retain both conversational roles outside the prompt')
   })
 })
 
@@ -392,10 +402,13 @@ await test('session-title requests use a temporary conversation and preserve the
     const first = await collect(adapter, options('main', history))
     assertSucceeded(first)
     const main = registry.providerSession('main')
-    const title = await collect(adapter, { ...options('main', [user('title-input', 'name this chat')]), purpose: 'session-title' })
+    const title = await collect(adapter, { ...options('main', [injected('title-input', 'name this chat', 'session-title')]), purpose: 'session-title' })
     assertSucceeded(title)
     assert.equal(registry.providerSession('main'), main, 'the title request replaced the main session mapping')
     assert.notEqual(state.prompts[1].id, main)
+    assert.equal(state.prompts[1].text, 'Continue using the current DSH context.')
+    assert.equal(state.prompts[1].options?.synthetic, true)
+    assert.deepEqual(state.bindings[1]?.context?.messages, [{ role: 'user', text: 'name this chat' }])
     assert.ok(state.deleted.includes(state.prompts[1].id), 'auxiliary provider conversations must be reclaimed')
     assertSucceeded(await collect(adapter, options('main', [
       ...history, assistant('a1', visibleText(first)), user('u2', 'continue the main work'),
@@ -403,5 +416,99 @@ await test('session-title requests use a temporary conversation and preserve the
     assert.equal(state.prompts[2].id, main)
     assert.ok(state.prompts[2].text.includes('continue the main work'))
     assert.ok(!state.prompts[2].text.includes('name this chat'))
+  })
+})
+
+await test('native prompts contain only human text while skill and runtime context stays request-scoped', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, state }) => {
+    const request = { ...options('context', [
+      injected('skill', 'SKILL instructions', 'skills'), user('u1', 'roses are red'),
+      injected('runtime', 'Runtime environment and current date', 'agent-runtime'),
+      { role: 'system', id: 'system-context', content: [{ type: 'text', text: 'Request system context' }] },
+    ]), system: 'Harness system prompt' }
+    assertSucceeded(await collect(adapter, request))
+    assert.equal(state.prompts[0].text, 'roses are red')
+    assert.match(state.prompts[0].options?.id ?? '', /^msg_/)
+    assert.notEqual(state.prompts[0].options?.synthetic, true)
+    assert.equal(state.bindings.length, 1, 'a tool-free request still needs the native context bridge')
+    assert.deepEqual(state.bindings[0].tools, [])
+    assert.ok(state.bindings[0].system.includes('Harness system prompt'))
+    assert.deepEqual(state.bindings[0].context, { before: state.prompts[0].options.id, replay: [], messages: [
+      { role: 'user', text: 'SKILL instructions' }, { role: 'user', text: 'Runtime environment and current date' },
+      { role: 'system', text: 'Request system context' },
+    ] })
+  })
+})
+
+await test('updated injected context replaces request context without rebuilding conversational memory', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, registry, state }) => {
+    const first = await collect(adapter, options('dynamic-context', [injected('runtime', 'Runtime version 1'), user('u1', 'first question')]))
+    assertSucceeded(first)
+    const main = registry.providerSession('dynamic-context')
+    assertSucceeded(await collect(adapter, options('dynamic-context', [injected('runtime', 'Runtime version 2'), user('u1', 'first question'),
+      assistant('a1', visibleText(first)), user('u2', 'follow up')])))
+    assert.equal(state.created, 1, 'a changed producer context invalidated the conversation cursor')
+    assert.equal(registry.providerSession('dynamic-context'), main)
+    assert.deepEqual(state.deleted, [])
+    assert.equal(state.prompts[1].text, 'follow up')
+    assert.deepEqual(state.bindings[1].context.messages, [{ role: 'user', text: 'Runtime version 2' }])
+    assert.deepEqual(state.bindings[1].context.replay, [])
+  })
+})
+
+await test('distinct human messages with repeated text remain distinct native turns', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, state }) => {
+    const first = await collect(adapter, options('repeated-text', [user('u1', 'roses are red')]))
+    assertSucceeded(first)
+    assertSucceeded(await collect(adapter, options('repeated-text', [user('u1', 'roses are red'), assistant('a1', visibleText(first)), user('u2', 'roses are red')])))
+    assert.equal(state.created, 1)
+    assert.deepEqual(state.prompts.map(prompt => prompt.text), ['roses are red', 'roses are red'])
+    assert.notEqual(state.prompts[0].options.id, state.prompts[1].options.id)
+  })
+})
+
+await test('historical replay preserves user and assistant roles across subsequent context bindings', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, state }) => {
+    const history = [user('prior-user', 'Write a poem'), assistant('prior-answer', 'We can write about roses'), user('u1', 'roses are red')]
+    const first = await collect(adapter, options('prefix', history))
+    assertSucceeded(first)
+    assert.equal(state.prompts[0].text, 'roses are red')
+    const replay = [{ before: state.prompts[0].options.id, messages: [{ role: 'user', text: 'Write a poem' }, { role: 'assistant', text: 'We can write about roses' }] }]
+    assert.deepEqual(state.bindings[0].context.replay, replay)
+    assertSucceeded(await collect(adapter, options('prefix', [...history, assistant('a1', visibleText(first)), user('u2', 'violets are blue')])))
+    assert.equal(state.prompts[1].text, 'violets are blue')
+    assert.deepEqual(state.bindings[1].context.replay, replay, 'replay before an earlier native prompt vanished on follow-up')
+    assert.equal(state.bindings[1].context.before, state.prompts[1].options.id)
+  })
+})
+
+await test('producer-only requests use a synthetic native trigger and retain the task as context', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, state }) => {
+    assertSucceeded(await collect(adapter, options('producer-only', [injected('task', 'Continue the queued plugin work')])))
+    assert.equal(state.prompts[0].text, 'Continue using the current DSH context.')
+    assert.equal(state.prompts[0].options.synthetic, true)
+    assert.deepEqual(state.bindings[0].context, { before: state.prompts[0].options.id, replay: [], messages: [{ role: 'user', text: 'Continue the queued plugin work' }] })
+  })
+})
+
+await test('an unchanged request without new human text or producer context still fails', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, state }) => {
+    const history = [user('u1', 'roses are red')]
+    assertSucceeded(await collect(adapter, options('unchanged', history)))
+    assert.equal(failureCode(await collect(adapter, options('unchanged', history))), 'INVALID_REQUEST')
+    assert.equal(state.prompts.length, 1)
+  })
+})
+
+await test('producer-only continuations retain native session and tool history', { timeout: 2500 }, async () => {
+  await withFakeClient(async ({ adapter, state, registry }) => {
+    const first = await collect(adapter, options('producer-memory', [injected('task', 'Start queued plugin work')]))
+    assertSucceeded(first)
+    const main = registry.providerSession('producer-memory')
+    assertSucceeded(await collect(adapter, options('producer-memory', [assistant('a1', visibleText(first)), injected('task-2', 'Continue queued work')])))
+    assert.equal(state.created, 1)
+    assert.equal(registry.providerSession('producer-memory'), main)
+    assert.deepEqual(state.deleted, [])
+    assert.deepEqual(state.bindings[1].context.replay, [], 'the native answer is already retained')
   })
 })

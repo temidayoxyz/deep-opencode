@@ -9,6 +9,8 @@ import { OpenCodeServer, OpenCodeServerPool } from '../lib/index.js'
 
 const root = resolve(tmpdir())
 const directory = resolve(mkdtempSync(join(root, 'deep-opencode-server-test-')))
+// TEMP may be inside this ESM repository; the fake executable uses require().
+writeFileSync(join(directory, 'package.json'), '{"type":"commonjs"}')
 const config = { opencodeCommand: process.execPath, host: '127.0.0.1', port: 0, startupTimeoutMs: 1000, cwd: directory }
 const server = new OpenCodeServer(config)
 let held

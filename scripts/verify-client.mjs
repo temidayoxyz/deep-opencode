@@ -37,3 +37,18 @@ await test('session creation supplies the native location and explicit permissio
     assert.equal(body.agent, 'custom-agent')
   } finally { globalThis.fetch = original }
 })
+
+await test('native admission preserves exact human text and distinguishes synthetic requests', async () => {
+  const original = globalThis.fetch
+  const requests = []
+  globalThis.fetch = async (url, init) => { requests.push({ url, body: JSON.parse(init.body) }); return Response.json({ data: {} }) }
+  try {
+    const client = new OpenCodeClient(server)
+    await client.prompt('ses_fixture', 'roses are red', undefined, { id: 'msg_human' })
+    await client.prompt('ses_fixture', 'Continue using the current DSH context.', undefined, { id: 'msg_plugin', synthetic: true })
+    assert.ok(requests[0].url.endsWith('/prompt'))
+    assert.deepEqual(requests[0].body, { id: 'msg_human', text: 'roses are red' })
+    assert.ok(requests[1].url.endsWith('/synthetic'))
+    assert.deepEqual(requests[1].body, { id: 'msg_plugin', text: 'Continue using the current DSH context.' })
+  } finally { globalThis.fetch = original }
+})

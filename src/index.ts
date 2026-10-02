@@ -76,7 +76,7 @@ export interface Config extends Omit<ServerConfig, 'cwd'> {
    * Whether a harness session keeps one OpenCode session for its whole
    * conversation. Disabling it restores one provider session per request, which
    * gives up conversational continuity: the model cannot recall an earlier turn
-   * and each turn re-sends the transcript.
+   * and each turn restores the conversation through the companion.
    */
   reuseSessions: boolean
   /** Maximum harness sessions mapped to a provider session at once. */
@@ -103,9 +103,8 @@ export interface Config extends Omit<ServerConfig, 'cwd'> {
   /** Report the managed server's version and discovered models on load. */
   logDiagnostics: boolean
   /**
-   * Include Harness context in the transcript preamble. Bridged main turns
-   * already receive their system prompt and scoped tool schemas through the
-   * native companion's context hook, independently of this legacy option.
+   * Add a capability-name summary to system context. Instructions and injected
+   * messages are always supplied through the native companion.
    */
   forwardHarnessContext: boolean
   /** Native OpenCode permission rules for newly created delegated sessions. */
@@ -162,9 +161,9 @@ function resolveConfig(config: Partial<Config> | undefined): Config {
 export function apply(ctx: Context, config?: Partial<Config>): void {
   const resolved = resolveConfig(config)
   let toolHost: HarnessToolHost | undefined
-  const toolBridge = resolved.bridgeHarnessTools ? new HarnessToolBridge(() => toolHost) : undefined
+  const toolBridge = new HarnessToolBridge(() => toolHost)
   const pluginDirectory = fileURLToPath(new URL('./opencode/', import.meta.url))
-  const pool = new OpenCodeServerPool(resolved, toolBridge === undefined ? undefined : () => toolBridgeEnvironment(toolBridge, pluginDirectory))
+  const pool = new OpenCodeServerPool(resolved, () => toolBridgeEnvironment(toolBridge, pluginDirectory))
   // A request without a session has no project to run in, so it falls back to
   // the configured directory rather than wherever the harness was launched.
   const fallbackDirectory = resolved.cwd ?? process.cwd()
@@ -194,7 +193,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     approvalHost = host
     scope.effect(() => () => { if (approvalHost === host) approvalHost = undefined })
   })
-  if (toolBridge !== undefined) ctx.inject(['agents', 'tools'], (scope) => {
+  if (resolved.bridgeHarnessTools) ctx.inject(['agents', 'tools'], (scope) => {
     const services = scope as unknown as Pick<HarnessToolHost, 'agents' | 'tools'> & {
       on(name: 'session/event', callback: (session: { id: string }, event: { type: string; data: { turn?: number; step?: number } }) => void): unknown
     }
@@ -220,6 +219,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
       permissions: resolved.sessionPermissions,
       agent: resolved.nativeAgent,
       toolBridge,
+      bridgeHarnessTools: resolved.bridgeHarnessTools,
       onEvent: (event) => ctx.parallel('deep-opencode/event', event),
       onPermission: async (event) => {
         const decision = await ctx.serial('deep-opencode/permission', event)

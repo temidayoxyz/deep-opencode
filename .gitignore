@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 
 package-lock.json
+.context-verification-*/
 
 # `lib/` is committed on purpose. Installing from a GitHub address runs pnpm,
 # which refuses to execute a git dependency's build scripts, so the built entry

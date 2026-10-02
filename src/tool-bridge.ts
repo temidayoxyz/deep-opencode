@@ -2,6 +2,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { createAssistantMessage, createToolResultMessage, LlmError, type ContentBlock, type ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { Branded } from '@deepseek-ai/dsh-brand'
+import type { TurnContext } from './prompt.ts'
 
 interface ToolOutcome {
   isError: boolean
@@ -29,10 +30,11 @@ export interface HarnessToolAgent {
 }
 
 export interface ToolBridgeTurn {
-  harnessSessionId: string
+  harnessSessionId?: string
   providerSessionId: string
   model?: string
   system?: string
+  context?: TurnContext
   tools: readonly ToolSchema[]
   signal: AbortSignal
 }
@@ -44,9 +46,7 @@ export interface ToolBridgeBinding {
 
 interface Binding extends ToolBridgeBinding {
   readonly turn: ToolBridgeTurn
-  readonly host: HarnessToolHost
-  readonly agent: HarnessToolAgent
-  readonly position: { turn: number; step: number }
+  readonly owner?: { host: HarnessToolHost; agent: HarnessToolAgent; position: { turn: number; step: number } }
   readonly schemas: ReadonlyMap<string, ToolSchema>
   readonly abort: AbortController
   readonly signal: AbortSignal
@@ -95,15 +95,16 @@ export class HarnessToolBridge {
     turn.signal.throwIfAborted()
     if (this.#disposed) throw new LlmError('DSH tool bridge has been unloaded', 'ABORTED')
     const host = this.#host()
-    const agent = host?.agents.get(turn.harnessSessionId)
+    const agent = turn.harnessSessionId === undefined ? undefined : host?.agents.get(turn.harnessSessionId)
     const position = agent === undefined ? undefined : host?.position(agent)
-    if (host === undefined || typeof host.tools?.execute !== 'function' || agent === undefined || position === undefined) {
+    if (turn.tools.length > 0 && (host === undefined || typeof host.tools?.execute !== 'function' || agent === undefined || position === undefined)) {
       throw new LlmError('DSH tools need a live agent, tool runtime, and open step to run through OpenCode', 'NO_TOOL_BRIDGE')
     }
     if (this.#bindings.has(turn.providerSessionId)) throw new LlmError('DSH tool bridge session is already bound', 'PROTOCOL')
     const abort = new AbortController()
     const binding: Binding = {
-      turn, host, agent, position, abort,
+      turn, abort,
+      owner: turn.tools.length > 0 && host !== undefined && agent !== undefined && position !== undefined ? { host, agent, position } : undefined,
       signal: AbortSignal.any([turn.signal, abort.signal]),
       schemas: new Map(turn.tools.map(schema => [schema.name, JSON.parse(JSON.stringify(schema)) as ToolSchema])),
       calls: new Map(), queue: Promise.resolve(), closed: false, concluded: false,
@@ -138,14 +139,26 @@ export class HarnessToolBridge {
       if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) throw new BridgeError('Unauthorized', 401)
       if (request.headers.origin !== undefined) throw new BridgeError('Browser origins are not accepted', 403)
       if (request.method !== 'POST') throw new BridgeError('Use POST', 405)
-      if (request.url !== '/tools/list' && request.url !== '/tools/call') throw new BridgeError('Unknown bridge route', 404)
+      if (request.url !== '/context' && request.url !== '/tools/list' && request.url !== '/tools/call') throw new BridgeError('Unknown bridge route', 404)
       if (!request.headers['content-type']?.startsWith('application/json')) throw new BridgeError('Use application/json', 415)
       const body = await readBody(request)
       const binding = typeof body.sessionId === 'string' ? this.#bindings.get(body.sessionId) : undefined
       if (binding === undefined || binding.closed || binding.signal.aborted) throw new BridgeError('No active DSH tool session', 403)
-      if (!this.#ownsOpenStep(binding)) throw new BridgeError('DSH tool owner is no longer available', 403)
-      if (request.url === '/tools/list') {
-        send(response, 200, { tools: [...binding.schemas.values()], system: binding.turn.system, concluded: binding.concluded })
+      if (binding.owner !== undefined && !this.#ownsOpenStep(binding)) throw new BridgeError('DSH tool owner is no longer available', 403)
+      if (request.url === '/tools/list' || request.url === '/context') {
+        const context = binding.turn.context
+        if (request.url === '/context' && body.phase === 'context' && context !== undefined) {
+          if (!Array.isArray(body.messageIds) || body.messageIds.some(id => typeof id !== 'string')) throw new BridgeError('Invalid native message identities', 400)
+          const ids = new Set(body.messageIds)
+          // Primary hooks see the complete active native history. An absent
+          // anchor has become a checkpoint; retirement survives later bindings.
+          for (const group of context.replay) if (!ids.has(group.before)) group.compacted = true
+        }
+        send(response, 200, { tools: [...binding.schemas.values()], concluded: binding.concluded,
+          ...(request.url === '/context' ? { system: binding.turn.system, context: context === undefined ? undefined : {
+            ...context, replay: context.replay.filter(group => !group.compacted).map(({ before, messages }) => ({ before, messages })),
+          } } : {}),
+        })
         return
       }
       if (typeof body.name !== 'string' || !binding.schemas.has(body.name)) throw new BridgeError('Tool is not available in this DSH request', 403)
@@ -183,18 +196,20 @@ export class HarnessToolBridge {
   }
 
   #ownsOpenStep(binding: Binding): boolean {
-    if (binding.host !== this.#host() || binding.host.agents.get(binding.turn.harnessSessionId) !== binding.agent) return false
-    const current = binding.host.position(binding.agent)
-    return current?.turn === binding.position.turn && current.step === binding.position.step
+    const owner = binding.owner
+    if (owner === undefined || owner.host !== this.#host() || owner.host.agents.get(owner.agent.id) !== owner.agent) return false
+    const current = owner.host.position(owner.agent)
+    return current?.turn === owner.position.turn && current.step === owner.position.step
   }
 
   async #execute(binding: Binding, name: string, args: unknown, signal: AbortSignal): Promise<ToolOutcome> {
     signal.throwIfAborted()
-    if (binding.closed || binding.concluded || !this.#ownsOpenStep(binding)) throw new BridgeError('DSH tool owner is no longer available', 403)
-    const { turn, step } = binding.position
+    const owner = binding.owner
+    if (owner === undefined || binding.closed || binding.concluded || !this.#ownsOpenStep(binding)) throw new BridgeError('DSH tool owner is no longer available', 403)
+    const { turn, step } = owner.position
     const callId = `opencode-${randomUUID()}` as Branded<'CallId'>
     const argumentsText = JSON.stringify(args)
-    const session = binding.agent.session
+    const session = owner.agent.session
     // This is already executed here, so it must not enter the outer stream's
     // tool-call blocks and trigger a second dispatch in the Harness agent loop.
     session.append('assistant/message', {
@@ -204,7 +219,7 @@ export class HarnessToolBridge {
     const call = session.append('tool/call', { turn, step, callId, name, arguments: argumentsText })
     let result: ToolOutcome
     try {
-      result = await binding.host.tools.execute({ callId, name, arguments: args, agent: binding.agent, signal })
+      result = await owner.host.tools.execute({ callId, name, arguments: args, agent: owner.agent, signal })
       if (signal.aborted && !result.isError) result = abortedResult()
     } catch {
       result = signal.aborted ? abortedResult() : { isError: true, content: [{ type: 'text', text: 'Error: DSH tool execution failed' }] }

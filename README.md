@@ -87,7 +87,7 @@ Every deployment-varying value is a `cordis.yml` field:
 | `logDiagnostics` | `true` | Report the managed server's version and discovered models on load. |
 | `catalogTimeoutMs` | `60000` | Wait for a cold server to populate its model catalogue. |
 | `diagnosticsPath` | `deep-opencode/diagnostics.json` under Harness home | Discovery report location. |
-| `forwardHarnessContext` | `false` | Also embed Harness context in the transcript preamble; the bridge already forwards it through the native context hook. |
+| `forwardHarnessContext` | `false` | Include a capability-name summary in the model's system context. Harness instructions and context are always forwarded through the companion. |
 | `bridgeHarnessTools` | `true` | Make the current request's DSH tools callable inside OpenCode through DSH's normal executor. |
 | `sessionPermissions` | OpenCode defaults | Native permission rules for new sessions, shaped as `{ action, resource, effect }`. |
 | `nativeAgent` | OpenCode default | Native agent selected when a delegated session is created. |
@@ -105,19 +105,26 @@ Every deployment-varying value is a `cordis.yml` field:
 
 #### What the model sees
 
-The first turn of a conversation sends a short preamble and the whole exchange
-labelled `User:` / `Assistant:`. Later turns send only the messages that are new,
-because OpenCode already holds the rest. The model sees its own prior turns
-through OpenCode's session rather than through text this plugin resends.
+Each native user prompt contains the human's exact text, with no `User:` label,
+preamble, runtime snapshot, or skill catalogue attached. The adapter uses DSH's
+message provenance to distinguish human input from plugin context; text that
+the human actually types is preserved, including literal reminder tags.
 
-The transcript preamble contains the working directory and a note that the
-agent has its own tools. With `bridgeHarnessTools: true` (the default), main
-turns also receive the Harness system prompt and exact tool schemas through
-the bundled OpenCode companion's context hook. The native agent calls a DSH
+The bundled OpenCode companion supplies the Harness system prompt and working
+directory separately. Skill catalogues, runtime snapshots, and other injected
+messages enter the model context with their original roles without becoming
+native user messages. The companion also restores initial or rebuilt history
+as separate user and assistant messages. Follow-ups keep OpenCode's native
+history, including its own answers and tool results. Updating injected context
+does not reset that conversation. Producer-only and auxiliary requests use a
+native synthetic trigger rather than impersonating human input.
+
+With `bridgeHarnessTools: true` (the default), main turns also receive the exact
+DSH tool schemas. The native agent calls a DSH
 plugin tool by passing its name and argument object to `dsh_call`; `dsh_list`
 refreshes the tools available to that request. No manual MCP setup is needed.
-The legacy `forwardHarnessContext` setting controls only the transcript
-preamble and can stay `false` when the bridge is enabled.
+`forwardHarnessContext` adds a capability-name summary to system context and
+can stay `false`. Disabling `bridgeHarnessTools` keeps context forwarding active.
 
 #### Agent execution and plugin integration
 
@@ -162,8 +169,9 @@ open Harness step. It rejects calls after cancellation, step closure, or Host
 unload; serializes calls; deduplicates provider call IDs; and drains owned tool
 work before releasing the step. It uses an authenticated loopback listener and
 adds the companion to the managed child's configuration without changing
-project or global config files. Auxiliary title and compaction calls receive
-no DSH tool binding. If a main request declares DSH tools but its live Host
+project or global config files. Auxiliary requests receive context without
+DSH tool access. Replayed history also participates in native compaction.
+If a main request declares DSH tools but its live Host
 services are missing, it fails with `NO_TOOL_BRIDGE` instead of pretending the
 tools are available. Set `bridgeHarnessTools: false` to use only native tools.
 
@@ -174,17 +182,17 @@ otherwise OpenCode's configured default remains in control.
 
 #### Token effect
 
-The preamble is short; bridged requests also include the Harness system prompt
-and scoped tool catalogue. Usage counts the entire native execution, including
-its tool loops, and is reported through the provider's token totals.
+Model input includes the Harness system prompt, injected context, and scoped
+tool catalogue even though these are absent from native user bubbles. A large
+skill catalogue still consumes input tokens. Usage counts the entire native
+execution, including its tool loops, through the provider's token totals.
 
 #### KV Cache effect
 
-Independent per turn, and better than a fresh request: the delegated turn runs
-inside one OpenCode session, so the provider's own prefix cache survives across
-turns. A follow-up sends only the new message, so it re-reads a stable prefix
-rather than a rebuilt transcript. A rewritten past message replays the whole
-conversation, which invalidates that reuse.
+Follow-ups reuse OpenCode's native history. Cache hits depend on the provider
+and the resulting model context: refreshed Harness context can change the
+prefix even when the native session is reused. Rewriting past conversation
+creates a new native session and restores history through the companion.
 
 ## Known Limitations and Deferred Work
 
@@ -206,9 +214,14 @@ conversation, which invalidates that reuse.
   native `location` field. Several projects cost several OpenCode processes.
 - **A session with no project directory falls back** to the `cwd` config field,
   or the harness's own working directory when that is unset.
-- **Initial and rebuilt history is flattened.** It is sent as labelled text
-  rather than structured history. Follow-ups send new messages; OpenCode's own
-  previous assistant answers are not duplicated.
+- **Replayed history is model context.** Inherited messages are restored with
+  their roles through the companion rather than inserted into native storage.
+  Existing native sessions created by older versions retain their saved text;
+  start a new Harness chat after updating to get a clean native transcript.
+- **Standalone adapter callers must configure the companion transport** to
+  forward Harness instructions, injected context, or replayed history. Missing
+  transport fails with `NO_TOOL_BRIDGE`; the normal Cordis plugin configures it
+  automatically, including when DSH tools are disabled.
 - **Only the free models are offered.** A paid OpenCode model is reachable
   through the harness's own `opencode`/`opencode-go` providers with a key; this
   route deliberately lists only zero-cost models, because a paid model reached
@@ -236,6 +249,7 @@ npm run typecheck
 npm run build
 npm run verify:offline
 npm run verify:server
+npm run verify:context
 npm run verify:agent
 npm run verify:bridge
 ```
@@ -247,6 +261,10 @@ auxiliary calls, stale discovery after unload, authenticated tool transport,
 scope isolation, policy denials, journal events, exactly-once dispatch, step
 closure, cancellation, conclusion, and companion registration. `verify:server` checks local
 process startup, restart, disposal, and Windows descendant shutdown.
+`verify:context` runs the installed OpenCode against a local deterministic model.
+It checks exact persisted human messages, model-facing context and replay,
+synthetic continuations, auxiliary requests, and native overflow compaction.
+Its temporary workspace and runtime data are isolated inside the repository.
 `verify:agent` requires a working OpenCode install and free model. It builds an
 eight-section HTML/CSS/JS page in an isolated temporary directory, then reads
 and edits it in the same provider session.

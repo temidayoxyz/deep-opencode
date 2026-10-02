@@ -10,6 +10,42 @@ const schema = (name) => ({
   description: `Run ${name} through its DSH plugin`,
   parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
 })
+
+await test('context transport works without a live DSH tool owner and never exposes it through dsh_list', async () => {
+  const bridge = new HarnessToolBridge(() => undefined)
+  const address = await bridge.start()
+  const context = { before: 'msg_current', replay: [], messages: [{ role: 'user', text: 'private injected catalogue' }] }
+  try {
+    const binding = bridge.bind({ providerSessionId: 'context-only', tools: [], system: 'private system', context, signal: new AbortController().signal })
+    const post = async path => {
+      const response = await fetch(address.baseUrl + path, { method: 'POST', headers: { Authorization: `Bearer ${address.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: 'context-only' }) })
+      return { status: response.status, data: await response.json() }
+    }
+    assert.deepEqual(await post('/context'), { status: 200, data: { tools: [], system: 'private system', context, concluded: false } })
+    const list = await post('/tools/list')
+    assert.equal(list.status, 200)
+    assert.deepEqual(list.data, { tools: [], concluded: false })
+    assert.equal((await post('/tools/call')).status, 403)
+    await binding.close()
+    assert.equal((await post('/context')).status, 403)
+  } finally { await bridge.dispose() }
+})
+
+await test('compacted replay is retired across bindings while recent-slice replay reaches the summary', async () => {
+  await withBridge(async ({ bind, post }) => {
+    const replay = [{ before: 'msg_recent', messages: [{ role: 'assistant', text: 'imported memory' }] }]
+    const context = { before: 'msg_current', messages: [], replay }
+    const binding = await bind({ context })
+    let response = await post('/context', { sessionId: 'provider-a', phase: 'compaction', messageIds: ['msg_older'] })
+    assert.equal(response.data.context.replay.length, 1)
+    response = await post('/context', { sessionId: 'provider-a', phase: 'context', messageIds: ['msg_checkpoint', 'msg_current'] })
+    assert.deepEqual(response.data.context.replay, [])
+    await binding.close()
+    await bind({ context: { ...context, before: 'msg_next' } })
+    response = await post('/context', { sessionId: 'provider-a', phase: 'compaction', messageIds: ['msg_checkpoint'] })
+    assert.deepEqual(response.data.context.replay, [], 'an old replay group reappeared in another compaction')
+  })
+})
 const result = (value = 'done') => ({ isError: false, content: [{ type: 'text', text: value }], value: { value } })
 const deferred = () => {
   let resolve

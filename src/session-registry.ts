@@ -23,6 +23,7 @@
 import type { Branded } from '@deepseek-ai/dsh-brand'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import type { OpenCodeClient } from './client.ts'
+import { isHuman, readText, type ContextReplay } from './prompt.ts'
 
 /** Message identity as the harness surfaces it. */
 type MessageId = string
@@ -44,7 +45,7 @@ interface Entry {
   sentThrough: MessageId | undefined
   /** How many entries have been sent, for the divergence check. */
   sentCount: number
-  /** Whether the system prompt and capability list have been sent already. */
+  /** Whether the native session has completed its first request. */
   preambleSent: boolean
   lastUsed: number
   /** Serialises turns; one in-flight turn per session. */
@@ -52,6 +53,8 @@ interface Entry {
   pending: number
   directory?: string
   history?: readonly DigestMessage[]
+  /** Role-correct context needed on every model request, until native compaction. */
+  replay?: readonly ContextReplay[]
 }
 
 export interface SessionState { entry: Entry; opencodeSessionId: string }
@@ -68,25 +71,11 @@ export interface DigestMessage {
   delegated?: boolean
 }
 
-/** Flattens one harness message's content blocks to text. */
-function textOf(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  const parts: string[] = []
-  for (const block of content) {
-    if (block !== null && typeof block === 'object' && (block as { type?: string }).type === 'text') {
-      const text = (block as { text?: unknown }).text
-      if (typeof text === 'string') parts.push(text)
-    }
-  }
-  return parts.join('')
-}
-
 /** The two roles OpenCode can be told about; everything else is not conversation. */
 function isConversible(message: GenerateOptions['messages'][number]): message is GenerateOptions['messages'][number] & { role: 'user' | 'assistant' } {
   // Tool results are OpenCode's own concern: it ran the tools, so replaying
   // harness tool results would describe work it already did.
-  return message.role === 'user' || message.role === 'assistant'
+  return isHuman(message) || message.role === 'assistant'
 }
 
 /** Projects a request's messages into identity, role and text. */
@@ -94,7 +83,7 @@ export function digest(options: GenerateOptions): DigestMessage[] {
   const messages: DigestMessage[] = []
   for (const message of options.messages) {
     if (!isConversible(message)) continue
-    messages.push({ id: message.id, role: message.role, text: textOf(message.content),
+    messages.push({ id: message.id, role: message.role, text: readText(message.content),
       delegated: message.role === 'assistant' ? message.source?.kind === 'model' ? message.source.provider === 'opencode-free' : true : undefined })
   }
   return messages
@@ -255,6 +244,7 @@ export class SessionRegistry {
       entry.sentCount = 0
       entry.preambleSent = false
       entry.history = undefined
+      entry.replay = undefined
     })
     // Only the count bound applies: an entry adopted moments ago is fresh, so
     // idle reclamation has nothing to say about it.
@@ -294,6 +284,7 @@ export class SessionRegistry {
     entry.sentCount = 0
     entry.preambleSent = false
     entry.history = undefined
+    entry.replay = undefined
   }
 
   /** Drops one harness session and returns its provider session for deletion. */
