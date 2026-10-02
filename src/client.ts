@@ -16,6 +16,8 @@ export const ROUTES = {
   sessionCreate: '/api/session',
   sessionDelete: (id: string): string => `/api/session/${id}`,
   sessionModel: (id: string): string => `/api/session/${id}/model`,
+  sessionPermissionReply: (id: string, request: string): string => `/api/session/${id}/permission/${request}/reply`,
+  sessionFormReply: (id: string, form: string): string => `/api/session/${id}/form/${form}/reply`,
   sessionPrompt: (id: string): string => `/api/session/${id}/prompt`,
   sessionInterrupt: (id: string): string => `/api/session/${id}/interrupt`,
   eventSubscribe: '/api/event',
@@ -118,8 +120,14 @@ export class OpenCodeClient {
   }
 
   /** `POST /api/session` — one delegated session per dsh request. */
-  async createSession(): Promise<string> {
-    const session = await this.#json<{ id?: string }>(ROUTES.sessionCreate, { method: 'POST', body: '{}' })
+  async createSession(signal?: AbortSignal, permissions?: readonly PermissionRule[], agent?: string): Promise<string> {
+    const session = await this.#json<{ id?: string }>(ROUTES.sessionCreate, {
+      method: 'POST', signal, body: JSON.stringify({
+        ...(this.#server.cwd === undefined ? {} : { location: { directory: this.#server.cwd } }),
+        ...(permissions === undefined ? {} : { permissions }),
+        ...(agent === undefined ? {} : { agent }),
+      }),
+    })
     if (session?.id === undefined) {
       throw new OpenCodeRequestError('OpenCode created a session without an id', 'PROTOCOL')
     }
@@ -128,7 +136,7 @@ export class OpenCodeClient {
 
   async deleteSession(id: string): Promise<void> {
     try {
-      await this.#json(ROUTES.sessionDelete(id), { method: 'DELETE' })
+      await this.#json(ROUTES.sessionDelete(id), { method: 'DELETE', signal: AbortSignal.timeout(5_000) })
     } catch {
       // A session the server already reclaimed is not an error for the caller.
     }
@@ -140,17 +148,19 @@ export class OpenCodeClient {
    * The body is `{model: {id, providerID}}`; the server rejects a flat string
    * and a `modelID` key, so both field names are load-bearing.
    */
-  async setModel(id: string, model: string, providerID: string): Promise<void> {
+  async setModel(id: string, model: string, providerID: string, signal?: AbortSignal): Promise<void> {
     await this.#json(ROUTES.sessionModel(id), {
       method: 'POST',
+      signal,
       body: JSON.stringify({ model: { id: model, providerID } }),
     })
   }
 
   /** `POST /api/session/{id}/prompt` — enqueues one turn; output arrives on the event stream. */
-  async prompt(id: string, text: string): Promise<void> {
+  async prompt(id: string, text: string, signal?: AbortSignal): Promise<void> {
     await this.#json(ROUTES.sessionPrompt(id), {
       method: 'POST',
+      signal,
       body: JSON.stringify({ text }),
     })
   }
@@ -158,10 +168,18 @@ export class OpenCodeClient {
   /** `POST /api/session/{id}/interrupt` — the cancellation path for an in-flight turn. */
   async interrupt(id: string): Promise<void> {
     try {
-      await this.#json(ROUTES.sessionInterrupt(id), { method: 'POST' })
+      await this.#json(ROUTES.sessionInterrupt(id), { method: 'POST', signal: AbortSignal.timeout(5_000) })
     } catch {
       // An already-idle session has nothing to interrupt.
     }
+  }
+
+  async replyPermission(id: string, request: string, decision: 'once' | 'always' | 'reject', signal?: AbortSignal): Promise<void> {
+    await this.#json(ROUTES.sessionPermissionReply(id, request), { method: 'POST', body: JSON.stringify({ decision }), signal })
+  }
+
+  async replyForm(id: string, form: string, answer: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+    await this.#json(ROUTES.sessionFormReply(id, form), { method: 'POST', body: JSON.stringify({ answer }), signal })
   }
 
   /**
@@ -204,21 +222,18 @@ export class OpenCodeClient {
         const { done, value } = await reader.read()
         if (done) return
         buffer += decoder.decode(value, { stream: true })
-        let boundary = buffer.indexOf('\n\n')
-        while (boundary !== -1) {
-          const frame = buffer.slice(0, boundary)
-          buffer = buffer.slice(boundary + 2)
-          for (const line of frame.split('\n')) {
-            if (!line.startsWith('data:')) continue
-            const payload = line.slice(5).trim()
-            if (payload.length === 0) continue
-            try {
-              yield JSON.parse(payload) as OpenCodeEvent
-            } catch {
-              // A frame that is not JSON is not a turn-ending failure.
-            }
+        let boundary = /\r?\n\r?\n/.exec(buffer)
+        while (boundary !== null) {
+          const frame = buffer.slice(0, boundary.index)
+          buffer = buffer.slice(boundary.index + boundary[0].length)
+          const payload = frame.split(/\r?\n/).filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart()).join('\n')
+          if (payload.length > 0) {
+            let parsed: OpenCodeEvent | undefined
+            try { parsed = JSON.parse(payload) as OpenCodeEvent } catch { /* Ignore non-JSON notices. */ }
+            if (parsed !== undefined) yield parsed
           }
-          boundary = buffer.indexOf('\n\n')
+          boundary = /\r?\n\r?\n/.exec(buffer)
         }
       }
     } finally {
@@ -226,3 +241,5 @@ export class OpenCodeClient {
     }
   }
 }
+
+export interface PermissionRule { action: string; resource: string; effect: 'allow' | 'ask' | 'deny' }

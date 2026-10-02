@@ -12,10 +12,28 @@
  * shapes are probed at runtime, and the server's reported version is logged
  * rather than compared.
  */
-import { type ChildProcess, spawn } from 'node:child_process'
+import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { accessSync, constants, statSync } from 'node:fs'
 import { delimiter, join } from 'node:path'
+
+/** Stop the exact managed process tree; native MCP children may be detached. */
+async function terminate(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const exited = once(child, 'exit').catch(() => undefined)
+  if (process.platform === 'win32' && child.pid !== undefined) {
+    const taskkill = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
+    await new Promise<void>((resolve) => {
+      execFile(taskkill, ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 5_000 }, () => resolve())
+    })
+  }
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const grace = new Promise<void>((resolve) => { timer = setTimeout(resolve, 3_000); timer.unref?.() })
+  await Promise.race([exited, grace])
+  if (timer !== undefined) clearTimeout(timer)
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+}
 
 /** One adapter's process-management settings; all deployment-varying. */
 export interface ServerConfig {
@@ -136,9 +154,13 @@ export class OpenCodeServer {
   #address: ServerAddress | undefined
   #starting: Promise<ServerAddress> | undefined
   #binary: string | undefined
+  #generation = 0
+  #disposed = false
+  readonly #prepareEnvironment: (() => Promise<Record<string, string>>) | undefined
 
-  constructor(config: ServerConfig) {
+  constructor(config: ServerConfig, prepareEnvironment?: () => Promise<Record<string, string>>) {
     this.#config = config
+    this.#prepareEnvironment = prepareEnvironment
   }
 
   /** Base URL of the running server, once started. */
@@ -162,15 +184,22 @@ export class OpenCodeServer {
    * a later attempt can retry.
    */
   async start(): Promise<ServerAddress> {
+    if (this.#disposed) throw new Error('OpenCode server has been disposed')
     if (this.#address !== undefined) return this.#address
     this.#starting ??= this.#launch().finally(() => {
       this.#starting = undefined
     })
-    this.#address = await this.#starting
+    const generation = this.#generation
+    const address = await this.#starting
+    if (generation !== this.#generation) throw new Error('OpenCode server stopped during startup')
+    this.#address = address
     return this.#address
   }
 
   async #launch(): Promise<ServerAddress> {
+    const generation = this.#generation
+    const environment = await this.#prepareEnvironment?.()
+    if (generation !== this.#generation) throw new Error('OpenCode server stopped during environment preparation')
     const { opencodeCommand, host, port, startupTimeoutMs } = this.#config
     const candidates = resolveCandidates(opencodeCommand)
     let spawnedChild: ChildProcess | undefined
@@ -182,6 +211,7 @@ export class OpenCodeServer {
     for (const candidate of candidates) {
       try {
         const attempt = spawn(candidate, ['serve', '--hostname', host, '--port', String(port)], {
+          ...(environment === undefined ? {} : { env: { ...process.env, ...environment } }),
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
           // The child's directory is the project its agent works in.
@@ -215,19 +245,31 @@ export class OpenCodeServer {
       )
     }
     const child = spawnedChild
+    if (generation !== this.#generation) {
+      await terminate(child)
+      throw new Error('OpenCode server stopped during spawn')
+    }
     this.#binary = spawnedBinary
     this.#child = child
+    child.once('exit', () => {
+      if (this.#child === child) {
+        this.#child = undefined
+        this.#address = undefined
+        this.#generation++
+      }
+    })
 
     let buffered = ''
     const onOutput = (chunk: Buffer): void => {
-      buffered += chunk.toString('utf8')
+      buffered = (buffered + chunk.toString('utf8')).slice(-16_384)
     }
     child.stdout?.on('data', onOutput)
     child.stderr?.on('data', onOutput)
 
     const exited = once(child, 'exit')
+    let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<never>((_, reject) => {
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         reject(new Error(`\`${spawnedBinary}\` did not report a listening URL within ${startupTimeoutMs}ms`))
       }, startupTimeoutMs)
       // Do not hold the event loop open for the startup timer.
@@ -249,8 +291,13 @@ export class OpenCodeServer {
       await this.stop()
       throw error
     } finally {
-      child.stdout?.off('data', onOutput)
-      child.stderr?.off('data', onOutput)
+      if (timer !== undefined) clearTimeout(timer)
+      // Keep draining both pipes while the child runs, or logs can fill a pipe
+      // and block the provider in the middle of a delegated execution.
+      child.once('close', () => {
+        child.stdout?.off('data', onOutput)
+        child.stderr?.off('data', onOutput)
+      })
     }
   }
 
@@ -290,18 +337,17 @@ export class OpenCodeServer {
 
   /** Terminates the child and forgets the address so a later `start()` relaunches. */
   async stop(): Promise<void> {
+    this.#generation++
     const child = this.#child
     this.#child = undefined
     this.#address = undefined
-    if (child === undefined || child.exitCode !== null) return
-    child.kill('SIGTERM')
-    const exited = once(child, 'exit').catch(() => undefined)
-    const grace = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 3000)
-      timer.unref?.()
-    })
-    await Promise.race([exited, grace])
-    if (child.exitCode === null) child.kill('SIGKILL')
+    if (child !== undefined) await terminate(child)
+  }
+
+  /** Permanently close a pooled server, including references retained by clients. */
+  async dispose(): Promise<void> {
+    this.#disposed = true
+    await this.stop()
   }
 }
 
@@ -324,9 +370,12 @@ export type PooledServerConfig = Omit<ServerConfig, 'cwd'>
 export class OpenCodeServerPool {
   readonly #config: PooledServerConfig
   readonly #servers = new Map<string, OpenCodeServer>()
+  #stopped = false
+  readonly #prepareEnvironment: (() => Promise<Record<string, string>>) | undefined
 
-  constructor(config: PooledServerConfig) {
+  constructor(config: PooledServerConfig, prepareEnvironment?: () => Promise<Record<string, string>>) {
     this.#config = config
+    this.#prepareEnvironment = prepareEnvironment
   }
 
   /**
@@ -340,12 +389,13 @@ export class OpenCodeServerPool {
    * @param fallback - directory to use when none is supplied or it is unusable
    */
   forDirectory(directory: string | undefined, fallback: string): OpenCodeServer {
+    if (this.#stopped) throw new Error('OpenCode server pool has been stopped')
     const chosen = directory !== undefined && isDirectory(directory) ? directory : fallback
     // Windows paths are case-insensitive, so the key is compared that way too.
     const key = process.platform === 'win32' ? chosen.toLowerCase() : chosen
     const existing = this.#servers.get(key)
     if (existing !== undefined) return existing
-    const server = new OpenCodeServer({ ...this.#config, cwd: chosen })
+      const server = new OpenCodeServer({ ...this.#config, cwd: chosen }, this.#prepareEnvironment)
     this.#servers.set(key, server)
     return server
   }
@@ -359,8 +409,9 @@ export class OpenCodeServerPool {
 
   /** Stops every server, for plugin unload. */
   async stopAll(): Promise<void> {
+    this.#stopped = true
     const servers = [...this.#servers.values()]
     this.#servers.clear()
-    await Promise.all(servers.map((server) => server.stop()))
+    await Promise.all(servers.map((server) => server.dispose()))
   }
 }

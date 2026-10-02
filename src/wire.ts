@@ -90,4 +90,5 @@ export const EXECUTION_FAILED = [
   'session.execution.failed',
   'session.error',
   'session.execution.aborted',
+  'session.execution.interrupted',
 ]

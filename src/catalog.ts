@@ -7,7 +7,7 @@
  * provider AND with a zero input cost are offered: those are the ones the free
  * tier actually serves, and they are the ones a direct client cannot reach.
  */
-import type { LlmModelInfo, LlmModelContext, ModelModality } from '@deepseek-ai/dsh-llm'
+import type { LlmModelInfo, LlmModelContext } from '@deepseek-ai/dsh-llm'
 import type { OpenCodeModelEntry } from './wire.ts'
 
 /**
@@ -37,10 +37,10 @@ export interface FreeModel extends LlmModelInfo {
 /** Whether one catalogue entry is a free model this route should serve. */
 export function isFreeModel(entry: OpenCodeModelEntry): boolean {
   if (entry.providerID !== OPENCODE_PROVIDER) return false
-  const cost = entry.cost?.[0]
   // An absent cost is unknown, not free: never offer a model whose price cannot
   // be confirmed, because a paid request through a free route is a real charge.
-  return cost !== undefined && (cost.input ?? 1) === 0
+  return entry.cost !== undefined && entry.cost.length > 0 && entry.cost.every((cost) =>
+    cost.input === 0 && cost.output === 0 && (cost.cache?.read ?? 0) === 0 && (cost.cache?.write ?? 0) === 0)
 }
 
 /** Projects one catalogue entry onto the route's model description. */
@@ -52,24 +52,11 @@ export function toFreeModel(entry: OpenCodeModelEntry): FreeModel {
     provider: OPENCODE_FREE_ROUTE,
     id: entry.id,
     name: entry.name ?? entry.id,
-    inputModalities: readModalities(entry),
+    // This adapter forwards text only, even when the native model accepts images.
+    inputModalities: ['text'],
     context: context === undefined ? undefined : { contextWindow: context },
     tools: entry.capabilities?.tools === true,
   }
-}
-
-/** Maps OpenCode's input modality strings onto the harness vocabulary. */
-function readModalities(entry: OpenCodeModelEntry): ModelModality[] | undefined {
-  const input = entry.capabilities?.input
-  if (input === undefined) return undefined
-  const modalities: ModelModality[] = []
-  for (const value of input) {
-    if (value === 'text') modalities.push('text')
-    // Only text and image are harness modalities; a video or pdf capability is
-    // not representable, so the route stays text-and-image.
-    if (value === 'image') modalities.push('image')
-  }
-  return modalities.length > 0 ? modalities : undefined
 }
 
 /** One discovered free model, or `undefined` when the id is not in the catalogue. */

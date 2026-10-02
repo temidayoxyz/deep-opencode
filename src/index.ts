@@ -21,6 +21,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -41,10 +42,21 @@ declare module '@deepseek-ai/cordis' {
 import { OpenCodeFreeAdapter } from './adapter.ts'
 import { OPENCODE_FREE_ROUTE } from './catalog.ts'
 import { clearCatalog, listModels, refreshCatalog } from './discovery.ts'
-import { OpenCodeClient, OpenCodeRequestError } from './client.ts'
+import { OpenCodeClient, OpenCodeRequestError, type PermissionRule } from './client.ts'
 import { OpenCodeServer, OpenCodeServerPool, type ServerConfig } from './server.ts'
-import { translateEvents, type DirectoryResolver } from './adapter.ts'
-import { SessionRegistry, deleteReclaimed } from './session-registry.ts'
+import { translateEvents, type DirectoryResolver, type OpenCodeEventContext } from './adapter.ts'
+import { SessionRegistry } from './session-registry.ts'
+import { requestHarnessPermission, type HarnessApprovalHost } from './approval.ts'
+import { HarnessToolBridge, type HarnessToolHost } from './tool-bridge.ts'
+import { toolBridgeEnvironment } from './tool-bridge-environment.ts'
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'deep-opencode/event'(context: OpenCodeEventContext): void
+    'deep-opencode/permission'(context: OpenCodeEventContext): 'once' | 'always' | 'reject' | undefined | Promise<'once' | 'always' | 'reject' | undefined>
+    'deep-opencode/form'(context: OpenCodeEventContext): Record<string, unknown> | undefined | Promise<Record<string, unknown> | undefined>
+  }
+}
 
 export const name = 'dsh-deep-opencode'
 export const inject = ['llm', 'sessions']
@@ -91,15 +103,17 @@ export interface Config extends Omit<ServerConfig, 'cwd'> {
   /** Report the managed server's version and discovered models on load. */
   logDiagnostics: boolean
   /**
-   * Forward the harness system prompt and tool list to the provider.
-   *
-   * Off by default. The provider runs its own agent turn with its own tools, so
-   * the harness prompt describes tools that were never given to it: with it
-   * forwarded, the model reliably announces it will read files, load a skill
-   * and run a command, and then stops, having no way to do any of it. Leave it
-   * on only if the harness tools are actually wired through to the provider.
+   * Include Harness context in the transcript preamble. Bridged main turns
+   * already receive their system prompt and scoped tool schemas through the
+   * native companion's context hook, independently of this legacy option.
    */
   forwardHarnessContext: boolean
+  /** Native OpenCode permission rules for newly created delegated sessions. */
+  sessionPermissions?: readonly PermissionRule[]
+  /** Native agent name; omission uses OpenCode's configured default agent. */
+  nativeAgent?: string
+  /** Make this request's DSH tool plugins callable by the delegated agent. */
+  bridgeHarnessTools: boolean
 }
 
 /**
@@ -138,6 +152,7 @@ const DEFAULTS: Config = {
   catalogTimeoutMs: 60_000,
   logDiagnostics: true,
   forwardHarnessContext: false,
+  bridgeHarnessTools: true,
 }
 
 function resolveConfig(config: Partial<Config> | undefined): Config {
@@ -146,7 +161,10 @@ function resolveConfig(config: Partial<Config> | undefined): Config {
 
 export function apply(ctx: Context, config?: Partial<Config>): void {
   const resolved = resolveConfig(config)
-  const pool = new OpenCodeServerPool(resolved)
+  let toolHost: HarnessToolHost | undefined
+  const toolBridge = resolved.bridgeHarnessTools ? new HarnessToolBridge(() => toolHost) : undefined
+  const pluginDirectory = fileURLToPath(new URL('./opencode/', import.meta.url))
+  const pool = new OpenCodeServerPool(resolved, toolBridge === undefined ? undefined : () => toolBridgeEnvironment(toolBridge, pluginDirectory))
   // A request without a session has no project to run in, so it falls back to
   // the configured directory rather than wherever the harness was launched.
   const fallbackDirectory = resolved.cwd ?? process.cwd()
@@ -168,6 +186,27 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     idleTtlMs: resolved.sessionIdleTtlMs,
     turnGraceMs: resolved.sessionTurnGraceMs,
   })
+  // These optional services are acquired when their plugins are available.
+  // Keep the actual Host agent so DSH can apply its normal approval policies.
+  let approvalHost: HarnessApprovalHost | undefined
+  ctx.inject(['agents', 'approval'], (scope) => {
+    const host = scope as unknown as HarnessApprovalHost
+    approvalHost = host
+    scope.effect(() => () => { if (approvalHost === host) approvalHost = undefined })
+  })
+  if (toolBridge !== undefined) ctx.inject(['agents', 'tools'], (scope) => {
+    const services = scope as unknown as Pick<HarnessToolHost, 'agents' | 'tools'> & {
+      on(name: 'session/event', callback: (session: { id: string }, event: { type: string; data: { turn?: number; step?: number } }) => void): unknown
+    }
+    const positions = new Map<string, { turn: number; step: number }>()
+    services.on('session/event', (session, event) => {
+      if (event.type === 'step/start' && event.data.turn !== undefined && event.data.step !== undefined) positions.set(session.id, { turn: event.data.turn, step: event.data.step })
+      if (event.type === 'step/end' || event.type === 'turn/end' || event.type === 'session/end') positions.delete(session.id)
+    })
+    const host: HarnessToolHost = { agents: services.agents, tools: services.tools, position: agent => positions.get(agent.id) }
+    toolHost = host
+    scope.effect(() => () => { if (toolHost === host) toolHost = undefined; positions.clear() })
+  })
   const adapter = new OpenCodeFreeAdapter(
     pool,
     fallbackDirectory,
@@ -177,6 +216,17 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
     registry,
     resolved.reuseSessions,
     resolved.forwardHarnessContext,
+    {
+      permissions: resolved.sessionPermissions,
+      agent: resolved.nativeAgent,
+      toolBridge,
+      onEvent: (event) => ctx.parallel('deep-opencode/event', event),
+      onPermission: async (event) => {
+        const decision = await ctx.serial('deep-opencode/permission', event)
+        return decision ?? requestHarnessPermission(approvalHost, event)
+      },
+      onForm: (event) => ctx.serial('deep-opencode/form', event),
+    },
   )
   const discoveryServer = pool.forDirectory(undefined, fallbackDirectory)
   const client = new OpenCodeClient(discoveryServer)
@@ -243,6 +293,7 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
       for (const delay of [0, 5_000, 15_000]) {
         if (cancelled) return
         if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+        if (cancelled) return
         try {
           if ((await refreshCatalog(client, resolved.catalogTimeoutMs)).length > 0) return
         } catch {
@@ -261,11 +312,13 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   // reload orphans neither a listener nor a session on disk.
   let sweep: ReturnType<typeof setInterval> | undefined
   ctx.effect(() => {
-    // Reclaiming on a timer is what bounds the provider sessions written to
-    // disk; the count bound is enforced on adopt, so this only reclaims by age.
+    // Turns enforce the count bound after releasing their lock. The timer
+    // reclaims idle sessions, with a positive cadence when idle TTL is disabled.
     sweep = setInterval(() => {
-      void registry.reclaim().then((ids) => deleteReclaimed(client, ids))
-    }, resolved.sessionIdleTtlMs)
+      void registry.reclaim().then((ids) => registry.deleteSessions(ids)).catch((error) => {
+        ctx.logger.warn(`deep-opencode: session reclamation failed: ${String(error)}`)
+      })
+    }, resolved.sessionIdleTtlMs > 0 ? resolved.sessionIdleTtlMs : 60_000)
     sweep.unref?.()
     return () => {
       if (sweep !== undefined) clearInterval(sweep)
@@ -274,17 +327,25 @@ export function apply(ctx: Context, config?: Partial<Config>): void {
   })
 
   ctx.effect(() => () => {
-    void pool.stopAll()
+    void adapter.dispose().then(() => registry.deleteSessions(registry.drain()))
+      .finally(async () => { try { await pool.stopAll() } finally { await toolBridge?.dispose() } })
+      .catch((error) => ctx.logger.warn(`deep-opencode: shutdown failed: ${String(error)}`))
   })
 }
 
 export { OPENCODE_FREE_ROUTE, OPENCODE_PROVIDER, isFreeModel, toFreeModel } from './catalog.ts'
-export { listModels, refreshCatalog }
+export { clearCatalog, listModels, refreshCatalog }
 export { OpenCodeClient, OpenCodeServer, OpenCodeServerPool, OpenCodeRequestError }
 export { SessionRegistry, deleteReclaimed, digest, planTurn } from './session-registry.ts'
 export type { TurnPlan, RegistryPolicy } from './session-registry.ts'
 export { OpenCodeFreeAdapter, translateEvents }
 export { authorizationHeader } from './server.ts'
 export type { ServerConfig } from './server.ts'
+export type { PermissionRule } from './client.ts'
+export type { OpenCodeIntegration, OpenCodeEventContext } from './adapter.ts'
 export type { FreeModel } from './catalog.ts'
 export { LlmError }
+export { requestHarnessPermission }
+export type { HarnessApprovalHost } from './approval.ts'
+export { HarnessToolBridge, toolBridgeEnvironment }
+export type { HarnessToolHost, HarnessToolAgent, ToolBridgeBinding, ToolBridgeTurn } from './tool-bridge.ts'

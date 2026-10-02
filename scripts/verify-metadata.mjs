@@ -29,6 +29,9 @@ const entries = [
   { id: 'some-other-free', providerID: 'groq', cost: [{ input: 0, output: 0 }] },
   // An entry with no cost is unknown, not free, and must not be offered.
   { id: 'unknown-cost', providerID: 'opencode' },
+  { id: 'paid-output', providerID: 'opencode', cost: [{ input: 0, output: 1 }] },
+  { id: 'paid-cache', providerID: 'opencode', cost: [{ input: 0, output: 0, cache: { write: 1 } }] },
+  { id: 'paid-tier', providerID: 'opencode', cost: [{ input: 0, output: 0 }, { input: 1, output: 1 }] },
 ]
 
 let failures = 0
@@ -56,8 +59,8 @@ check('every model has a positive context window',
   models.every((m) => (m.context?.contextWindow ?? 0) > 0),
   models.map((m) => `${m.id}=${m.context?.contextWindow}`).join(' '))
 
-check('modalities are limited to the harness vocabulary',
-  models.every((m) => (m.inputModalities ?? []).every((v) => v === 'text' || v === 'image')),
+check('modalities advertise only text, which the delegated route forwards',
+  models.every((m) => JSON.stringify(m.inputModalities) === '["text"]'),
   JSON.stringify(models.map((m) => m.inputModalities)))
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)

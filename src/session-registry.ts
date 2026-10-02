@@ -49,7 +49,12 @@ interface Entry {
   lastUsed: number
   /** Serialises turns; one in-flight turn per session. */
   queue: Promise<unknown>
+  pending: number
+  directory?: string
+  history?: readonly DigestMessage[]
 }
+
+export interface SessionState { entry: Entry; opencodeSessionId: string }
 
 const DEFAULTS: RegistryPolicy = { maxSessions: 32, idleTtlMs: 30 * 60_000, turnGraceMs: 10 * 60_000 }
 
@@ -59,6 +64,8 @@ export interface DigestMessage {
   /** Who said it. Kept because a conversation may hold consecutive user turns. */
   role: 'user' | 'assistant'
   text: string
+  /** Assistant messages from another provider still need to be forwarded. */
+  delegated?: boolean
 }
 
 /** Flattens one harness message's content blocks to text. */
@@ -87,7 +94,8 @@ export function digest(options: GenerateOptions): DigestMessage[] {
   const messages: DigestMessage[] = []
   for (const message of options.messages) {
     if (!isConversible(message)) continue
-    messages.push({ id: message.id, role: message.role, text: textOf(message.content) })
+    messages.push({ id: message.id, role: message.role, text: textOf(message.content),
+      delegated: message.role === 'assistant' ? message.source?.kind === 'model' ? message.source.provider === 'opencode-free' : true : undefined })
   }
   return messages
 }
@@ -135,7 +143,8 @@ export function planTurn(
     // The anchor was rewritten away: replay everything into a fresh session.
     return { messages, sendPreamble: !preambleSent, resendAll: true }
   }
-  const delta = messages.slice(anchor + 1).filter((message) => message.text.length > 0)
+  const delta = messages.slice(anchor + 1).filter((message) => message.text.length > 0 &&
+    (message.role !== 'assistant' || message.delegated === false))
   if (delta.length === 0) {
     // A retried or repeated turn carries nothing new; the provider session
     // already holds this exchange, so there is nothing to add.
@@ -148,6 +157,7 @@ export function planTurn(
 export class SessionRegistry {
   readonly #entries = new Map<Branded<'SessionId'>, Entry>()
   readonly #policy: RegistryPolicy
+  readonly #clients = new Map<string, RegistryClient>()
 
   constructor(policy: Partial<RegistryPolicy> = {}) {
     this.#policy = { ...DEFAULTS, ...policy }
@@ -175,27 +185,33 @@ export class SessionRegistry {
    */
   async withEntry<T>(
     sessionId: Branded<'SessionId'>,
-    task: (state: { entry: Entry; opencodeSessionId: string }) => Promise<T>,
+    task: (state: SessionState) => Promise<T>,
   ): Promise<T> {
-    const previous = this.#entries.get(sessionId)?.queue ?? Promise.resolve()
+    const existing = this.#entries.get(sessionId) ?? this.#insertPlaceholder(sessionId)
+    existing.pending++
+    const previous = existing.queue
     // A failed turn must not reject the queue, or the next turn inherits the
     // error instead of running.
     const run = previous.then(
       () => this.#runEntry(sessionId, task),
       () => this.#runEntry(sessionId, task),
     )
-    const existing = this.#entries.get(sessionId) ?? this.#insertPlaceholder(sessionId)
     existing.queue = run.then(
       () => undefined,
       () => undefined,
     )
-    return await run
+    try {
+      return await run
+    } finally {
+      existing.pending--
+      existing.lastUsed = Date.now()
+    }
   }
 
   /** Runs `task` with the live entry, creating one on first use. */
   async #runEntry<T>(
     sessionId: Branded<'SessionId'>,
-    task: (state: { entry: Entry; opencodeSessionId: string }) => Promise<T>,
+    task: (state: SessionState) => Promise<T>,
   ): Promise<T> {
     const entry = this.#entries.get(sessionId) ?? this.#insertPlaceholder(sessionId)
     entry.lastUsed = Date.now()
@@ -220,6 +236,7 @@ export class SessionRegistry {
       preambleSent: false,
       lastUsed: Date.now(),
       queue: Promise.resolve(),
+      pending: 0,
     }
   }
 
@@ -237,6 +254,7 @@ export class SessionRegistry {
       entry.sentThrough = undefined
       entry.sentCount = 0
       entry.preambleSent = false
+      entry.history = undefined
     })
     // Only the count bound applies: an entry adopted moments ago is fresh, so
     // idle reclamation has nothing to say about it.
@@ -248,7 +266,9 @@ export class SessionRegistry {
     const evicted: string[] = []
     if (this.#entries.size <= this.#policy.maxSessions) return evicted
     const byAge = [...this.#entries].sort((a, b) => a[1].lastUsed - b[1].lastUsed)
-    for (const [sessionId, entry] of byAge.slice(0, this.#entries.size - this.#policy.maxSessions)) {
+    for (const [sessionId, entry] of byAge) {
+      if (this.#entries.size <= this.#policy.maxSessions) break
+      if (entry.pending > 0) continue
       if (entry.opencodeSessionId !== '') evicted.push(entry.opencodeSessionId)
       this.#entries.delete(sessionId)
     }
@@ -273,6 +293,7 @@ export class SessionRegistry {
     entry.sentThrough = undefined
     entry.sentCount = 0
     entry.preambleSent = false
+    entry.history = undefined
   }
 
   /** Drops one harness session and returns its provider session for deletion. */
@@ -286,14 +307,15 @@ export class SessionRegistry {
   /**
    * Reclaims entries past the count bound or idle past the TTL.
    *
-   * An entry mid-turn is protected by `turnGraceMs` from the last touch, so
-   * reclamation cannot delete a provider session a running turn is using.
+   * Active and queued turns are protected until their queue drains. Idle
+   * entries also respect `turnGraceMs` from their last touch.
    *
    * @returns the provider sessions to delete, for the caller to remove
    */
   async reclaim(now = Date.now()): Promise<string[]> {
     const expired: string[] = []
     for (const [sessionId, entry] of this.#entries) {
+      if (entry.pending > 0 || this.#policy.idleTtlMs <= 0) continue
       // A turn in flight is protected from the start of the grace window, so a
       // sweep cannot delete the provider session a running turn is using.
       if (now - entry.lastUsed < this.#policy.turnGraceMs) continue
@@ -320,6 +342,17 @@ export class SessionRegistry {
     const ids = this.all()
     this.#entries.clear()
     return ids
+  }
+
+  /** Reclaimed sessions must be deleted through the server that created them. */
+  bindClient(id: string, client: RegistryClient): void { this.#clients.set(id, client) }
+
+  async deleteSessions(ids: readonly string[]): Promise<void> {
+    for (const id of ids) {
+      const client = this.#clients.get(id)
+      this.#clients.delete(id)
+      await client?.deleteSession(id)
+    }
   }
 }
 

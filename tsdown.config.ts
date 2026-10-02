@@ -1,20 +1,19 @@
 import type { UserConfig } from 'tsdown'
 
 /**
- * Host-only build: one Node ESM entry at `lib/index.js`. The plugin registers a
- * Host-side `ctx.llm` adapter, so it has no browser half and no `dsh.client`
- * declaration in package.json.
+ * Node ESM entries for the DSH Host adapter and its dependency-free OpenCode
+ * companion. Neither entry needs a browser half or `dsh.client` declaration.
  */
 const config: UserConfig = {
   name: 'dsh-deep-opencode',
-  entry: { index: 'src/index.ts' },
+  entry: { index: 'src/index.ts', 'opencode/index': 'src/opencode-plugin.ts' },
   outDir: 'lib',
   format: ['esm'],
   platform: 'node',
   target: 'es2024',
   dts: false,
   clean: true,
-  outputOptions: { entryFileNames: 'index.js' },
+  outputOptions: { entryFileNames: '[name].js' },
 }
 
 export default config

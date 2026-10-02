@@ -29,6 +29,7 @@ const events = [
     finish: 'stop',
     tokens: { input: 100, output: 20, reasoning: 12, cache: { read: 5, write: 0 } },
   }),
+  ev('session.execution.succeeded', {}),
 ]
 
 const chunks = translateEvents(events)
@@ -88,7 +89,7 @@ check('indexes follow the stream, not the kind',
   reversedStarts[1]?.blockType === 'reasoning' && reversedStarts[1]?.index === 1,
   reversedStarts.map((c) => `${c.blockType}#${c.index}`).join(' '))
 
-// A second assistant message restarts the index space.
+// Multiple provider steps belong to one Harness response and need distinct indexes.
 const second = translateEvents([
   ev('session.text.started', { ordinal: 0 }),
   ev('session.text.delta', { ordinal: 0, delta: 'first' }),
@@ -97,8 +98,8 @@ const second = translateEvents([
   { type: 'session.text.delta', data: { assistantMessageID: 'msg_second', ordinal: 0, delta: 'second' } },
 ])
 const secondStarts = second.filter((c) => c.type === 'block-start')
-check('a new assistant message restarts the index space',
-  secondStarts.length === 2 && secondStarts.every((c) => c.index === 0),
+check('a new assistant message keeps distinct indexes within the delegated response',
+  secondStarts.length === 2 && secondStarts[0].index === 0 && secondStarts[1].index === 1,
   secondStarts.map((c) => c.index).join(','))
 
 console.log(failures === 0 ? '\nALL CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)

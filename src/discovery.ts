@@ -17,6 +17,7 @@ import type { OpenCodeClient } from './client.ts'
 
 /** The models this route currently offers. */
 let cached: FreeModel[] = []
+let generation = 0
 
 /**
  * How long to keep asking a server that reports an empty catalogue.
@@ -47,9 +48,11 @@ export function listModels(): FreeModel[] {
  * no models on every first load and leave the route unselectable.
  */
 export async function refreshCatalog(client: OpenCodeClient, timeoutMs = CATALOG_TIMEOUT_MS): Promise<FreeModel[]> {
+  const startedGeneration = generation
   const deadline = Date.now() + Math.max(timeoutMs, 0)
   for (;;) {
     const entries = await client.listModels()
+    if (startedGeneration !== generation) return []
     if (entries.length > 0) {
       cached = entries.filter(isFreeModel).map(toFreeModel)
       return cached
@@ -77,5 +80,6 @@ export function listModelInfo(): readonly LlmModelInfo[] {
 
 /** Empties the catalogue, called when the route is released. */
 export function clearCatalog(): void {
+  generation++
   cached = []
 }

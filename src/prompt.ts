@@ -2,10 +2,9 @@
  * Turns one delegated turn into the text OpenCode receives.
  *
  * Two shapes, because there are two situations. When a conversation is already
- * mapped to a provider session, only what is new is sent, and the system
- * prompt and capability list go once at the start: OpenCode keeps the
- * conversation itself, and repeating the preamble each turn would accumulate
- * duplicates in its own context.
+ * mapped to a provider session, only what is new is sent. The transcript
+ * preamble goes once at the start: OpenCode keeps the conversation itself.
+ * The native companion supplies scoped DSH context separately on each request.
  *
  * When there is no mapped session, or the cursor found the history had been
  * rewritten, the whole conversation is sent as one labelled transcript. That is
@@ -37,16 +36,9 @@ function readText(content: unknown): string {
 /**
  * The one-time context a provider session is opened with.
  *
- * It is deliberately almost nothing. The harness's system prompt and its tool
- * list describe a harness that is not running: the provider executes its own
- * agent turn with its own tools, and nothing in that list is callable from
- * here. Forwarding it produced a confident model that announced it would read
- * files, load a skill and run a command, and then stopped, because it had no
- * way to do any of it and had been told it had.
- *
- * So the preamble says only what is true: where the turn runs, and that the
- * agent has its own tools for the work. Everything else the provider already
- * knows, from its own system prompt and the project's own agent instructions.
+ * The default preamble gives the working directory and native capabilities.
+ * The bridge's context hook supplies the Harness system prompt and DSH tool
+ * schemas separately, so tool availability stays scoped to the active step.
  *
  * It is not repeated per turn: the provider applies it once and keeps it, so
  * resending would accumulate duplicates in its own context.
@@ -58,8 +50,7 @@ function readText(content: unknown): string {
  */
 export function buildPreamble(options: GenerateOptions, context: PreambleContext): string {
   if (context.forwardHarnessContext) {
-    // Opt-in, for a caller that has wired the harness tools through to the
-    // provider and therefore wants the harness prompt and tool list forwarded.
+    // Legacy opt-in for also embedding Harness context in the transcript.
     const sections: string[] = []
     if (options.system !== undefined && options.system.length > 0) sections.push(options.system)
     const tools = options.tools ?? []
@@ -75,7 +66,7 @@ export function buildPreamble(options: GenerateOptions, context: PreambleContext
   return (
     `You are working in ${context.workingDirectory}. ` +
     'You have your own tools for reading and writing files, running shell commands and searching ' +
-    'the project. Do the work with them: read what you need, then make the change. ' +
+    'the project. Use them when the user asks for work that requires them. ' +
     'Do not describe steps you are not going to take, and do not ask for tools you were not given.'
   )
 }
@@ -85,10 +76,8 @@ export type PreambleContext = {
   /** The project directory the turn runs in, when one is known. */
   workingDirectory: string | undefined
   /**
-   * Whether to forward the harness system prompt and tool list.
-   *
-   * Off by default, because those describe tools the provider was not given.
-   * Turn it on only for a provider that has actually had them wired through.
+   * Whether to embed Harness context in the transcript preamble as well as
+   * any context supplied by the native companion. Off by default.
    */
   forwardHarnessContext: boolean
 }
@@ -145,7 +134,7 @@ export function buildDeltaPrompt(
     if (preamble.length > 0) parts.push(preamble)
   }
   for (const message of messages) {
-    if (message.text.length > 0) parts.push(message.text)
+    if (message.text.length > 0) parts.push(`${label(message.role)}: ${message.text}`)
   }
   return parts.join('\n\n')
 }
